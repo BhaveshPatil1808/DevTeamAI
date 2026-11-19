@@ -1,0 +1,41 @@
+const fs = require("node:fs");
+const path = require("node:path");
+
+function getStoreDirectory(projectRoot) {
+    const directory = path.resolve(projectRoot, ".devteam");
+    fs.mkdirSync(directory, { recursive: true });
+    return directory;
+}
+
+function saveProjectState(projectRoot, state) {
+    const directory = getStoreDirectory(projectRoot);
+    const destination = path.join(directory, "project.json");
+    const temporary = destination + ".tmp";
+
+    fs.writeFileSync(
+        temporary,
+        JSON.stringify(state, null, 2),
+        "utf8"
+    );
+
+    fs.renameSync(temporary, destination);
+}
+
+function recordEvent(projectRoot, event) {
+    const directory = getStoreDirectory(projectRoot);
+    const file = path.join(directory, "events.jsonl");
+
+    fs.appendFileSync(
+        file,
+        JSON.stringify({
+            timestamp: new Date().toISOString(),
+            ...event
+        }) + "\n",
+        "utf8"
+    );
+}
+
+module.exports = {
+    saveProjectState,
+    recordEvent
+};

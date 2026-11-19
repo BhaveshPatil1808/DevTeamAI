@@ -1,0 +1,1961 @@
+
+"use strict";
+
+const fs = require("node:fs");
+const path = require("node:path");
+const { randomUUID } = require("node:crypto");
+
+const { createProjectPlan } = require("./planner");
+const { executePlannedTask } = require("./delegator");
+const { integrateProject } = require("./integration-engine");
+const { runStaticQA } = require("./qa-runner");
+const { runAutomatedRepair } = require("./repair-runner");
+
+const {
+    runApprovedFunctionalTests
+} = require("./functional-test-runner");
+
+const {
+    getProjectRoot,
+    writeAgentFiles
+} = require("../runtime/file-manager");
+
+const {
+    saveProjectState,
+    recordEvent
+} = require("../runtime/project-store");
+
+const {
+    saveCheckpoint
+} = require("../runtime/checkpoint-manager");
+
+const {
+    recoverProjectState
+} = require("./recovery-manager");
+
+const {
+    exportIntegratedProject
+} = require("../runtime/export-project");
+
+const MAX_AGENT_RECOVERY_ROUNDS = 1;
+const AGENT_RECOVERY_DELAY_MS = 1500;
+// The project is only "done" once it really runs, so the repair loop is
+// allowed to go around several times. Override with the environment
+// variable MAX_FUNCTIONAL_REPAIR_CYCLES (1-15).
+const MAX_FUNCTIONAL_REPAIR_CYCLES = (() => {
+    const configured = Number(process.env.MAX_FUNCTIONAL_REPAIR_CYCLES);
+
+    return Number.isInteger(configured) &&
+        configured >= 1 &&
+        configured <= 15
+        ? configured
+        : 6;
+})();
+
+const MAX_QA_FOLLOWUPS_PER_CYCLE = 2;
+
+
+// --------------------------------------------------
+// HELPERS
+// --------------------------------------------------
+
+function evaluateIntegrationGate(tasks, completedTaskIds, generatedFiles) {
+    const requiredIntegrationAgents = new Set([
+        "business-analyst",
+        "solution-architect",
+        "backend-developer",
+        "frontend-developer",
+        "integration-engineer"
+    ]);
+
+    const completedAgentIds = new Set(
+        tasks
+            .filter(task => completedTaskIds.has(task.id))
+            .map(task => task.agentId)
+    );
+
+    const missingRequiredAgents = [
+        ...requiredIntegrationAgents
+    ].filter(agentId => !completedAgentIds.has(agentId));
+
+    return {
+        allowed:
+            Array.isArray(generatedFiles) &&
+            generatedFiles.length > 0 &&
+            missingRequiredAgents.length === 0,
+
+        missingRequiredAgents
+    };
+}
+
+
+function slugify(value) {
+    return String(value)
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/^-|-$/g, "")
+        .slice(0, 50);
+}
+
+
+function validateRunId(runId) {
+    return (
+        typeof runId === "string" &&
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(runId)
+    );
+}
+
+
+function readPreviousAgentFiles(projectRoot, generatedFiles) {
+    const MAX_TOTAL_CONTEXT = 30000;
+    const MAX_FILE_CONTEXT = 12000;
+
+    let totalBytes = 0;
+    const artifacts = [];
+
+    let realProjectRoot;
+
+    try {
+        realProjectRoot = fs.realpathSync(projectRoot);
+    } catch {
+        return "Project directory is not available.";
+    }
+
+    for (const file of generatedFiles || []) {
+        if (totalBytes >= MAX_TOTAL_CONTEXT) {
+            break;
+        }
+
+        if (!file || typeof file.path !== "string") {
+            continue;
+        }
+
+        try {
+            const absolutePath = path.resolve(
+                projectRoot,
+                file.path
+            );
+
+            const relative = path.relative(
+                projectRoot,
+                absolutePath
+            );
+
+            if (
+                !relative ||
+                relative === ".." ||
+                relative.startsWith(".." + path.sep) ||
+                path.isAbsolute(relative)
+            ) {
+                continue;
+            }
+
+            const realFilePath = fs.realpathSync(absolutePath);
+
+            const realRelative = path.relative(
+                realProjectRoot,
+                realFilePath
+            );
+
+            if (
+                !realRelative ||
+                realRelative === ".." ||
+                realRelative.startsWith(".." + path.sep) ||
+                path.isAbsolute(realRelative)
+            ) {
+                continue;
+            }
+
+            const stats = fs.lstatSync(absolutePath);
+
+            if (!stats.isFile() || stats.isSymbolicLink()) {
+                continue;
+            }
+
+            const remaining = MAX_TOTAL_CONTEXT - totalBytes;
+
+            const allowedBytes = Math.min(
+                MAX_FILE_CONTEXT,
+                remaining
+            );
+
+            if (stats.size > allowedBytes) {
+                artifacts.push(
+                    `FILE: ${file.path}\n` +
+                    `[File omitted: ${stats.size} bytes exceeds the remaining shared-context limit.]`
+                );
+
+                continue;
+            }
+
+            const content = fs.readFileSync(
+                realFilePath,
+                "utf8"
+            );
+
+            artifacts.push(
+                `FILE: ${file.path}\n` +
+                `CONTENT:\n${content}`
+            );
+
+            totalBytes += Buffer.byteLength(
+                content,
+                "utf8"
+            );
+
+        } catch (error) {
+            console.warn(
+                `[PROJECT] Could not read previous artifact ${file.path}: ${error.message}`
+            );
+        }
+    }
+
+    return artifacts.length
+        ? artifacts.join("\n\n--- NEXT GENERATED FILE ---\n\n")
+        : "No previous generated source files available.";
+}
+
+
+function buildCompletedTaskContext(tasks) {
+    return tasks
+        .filter(
+            task =>
+                task.status === "completed" &&
+                task.result
+        )
+        .map(task =>
+            `${task.title} (${task.result.agentName || task.agentId}): ` +
+            `${task.result.summary || "Completed."}`
+        );
+}
+
+
+function normalizeRepairResult(
+    repairResult,
+    previousSnapshotId
+) {
+    if (
+        !repairResult ||
+        typeof repairResult !== "object"
+    ) {
+        throw new Error(
+            "Repair engine returned an invalid result."
+        );
+    }
+
+    const attempts = Array.isArray(repairResult.attempts)
+        ? repairResult.attempts
+        : [];
+
+    if (!Array.isArray(repairResult.integrationFiles)) {
+        throw new Error(
+            "Repair engine did not return an integration file list."
+        );
+    }
+
+    if (!validateRunId(repairResult.snapshotRunId)) {
+        throw new Error(
+            "Repair engine returned a missing or invalid snapshot ID."
+        );
+    }
+
+    if (
+        repairResult.qaReport?.status === "passed" &&
+        repairResult.snapshotRunId === previousSnapshotId
+    ) {
+        throw new Error(
+            "Repair reported successful QA without creating a new snapshot."
+        );
+    }
+
+    if (
+        repairResult.snapshotRunId !== previousSnapshotId &&
+        repairResult.integrationFiles.length === 0
+    ) {
+        throw new Error(
+            "Repair created a new snapshot but returned no integration files."
+        );
+    }
+
+    return {
+        ...repairResult,
+        attempts
+    };
+}
+
+
+function createInitialIntegrationState() {
+    return {
+        status: "pending",
+        summary: null,
+        files: [],
+        error: null,
+        snapshotRunId: null
+    };
+}
+
+
+function createInitialQAState() {
+    return {
+        status: "pending",
+        report: null,
+        error: null,
+        repair: null
+    };
+}
+
+
+function createInitialVerificationState(approved = false) {
+    return {
+        status: "pending",
+        approval: approved ? "granted" : "not_granted",
+        build: "not_run",
+        functionalTests: "not_run",
+        report: null,
+        evidence: [],
+        repairCycles: []
+    };
+}
+
+
+function safeErrorMessage(error) {
+    return error && typeof error.message === "string"
+        ? error.message
+        : String(error || "Unknown error");
+}
+
+
+// --------------------------------------------------
+// MAIN PROJECT RUNNER
+// --------------------------------------------------
+
+async function runProject({
+    projectName,
+    description,
+    runId: suppliedRunId,
+    resume = false,
+    approveFunctionalTests = false,
+    dependencies = {}
+}) {
+    // --------------------------------------------------
+    // INPUT VALIDATION
+    // --------------------------------------------------
+
+    if (
+        typeof projectName !== "string" ||
+        !projectName.trim()
+    ) {
+        throw new Error(
+            "Please provide a valid project name."
+        );
+    }
+
+    if (
+        typeof description !== "string" ||
+        !description.trim()
+    ) {
+        throw new Error(
+            "Please provide a project description."
+        );
+    }
+
+    const projectSlug = slugify(projectName);
+
+    if (!projectSlug) {
+        throw new Error(
+            "Please provide a valid project name."
+        );
+    }
+
+    if (
+        !dependencies ||
+        typeof dependencies !== "object" ||
+        Array.isArray(dependencies)
+    ) {
+        throw new Error(
+            "Project runner dependencies must be an object."
+        );
+    }
+
+    const projectRoot = getProjectRoot(projectSlug);
+
+    // --------------------------------------------------
+    // DEPENDENCY INJECTION
+    // --------------------------------------------------
+
+    const services = {
+        createProjectPlan,
+        executePlannedTask,
+        integrateProject,
+        runStaticQA,
+        runAutomatedRepair,
+        runApprovedFunctionalTests,
+        ...dependencies
+    };
+
+    for (const name of [
+        "createProjectPlan",
+        "executePlannedTask",
+        "integrateProject",
+        "runStaticQA",
+        "runAutomatedRepair",
+        "runApprovedFunctionalTests"
+    ]) {
+        if (typeof services[name] !== "function") {
+            throw new Error(
+                `Project runner dependency "${name}" must be a function.`
+            );
+        }
+    }
+
+    // --------------------------------------------------
+    // RUN ID AND EXECUTION MODE
+    // --------------------------------------------------
+
+    const isResume = resume === true;
+
+    const runId = suppliedRunId || randomUUID();
+
+    if (!validateRunId(runId)) {
+        throw new Error("Invalid project run ID.");
+    }
+
+    if (isResume && !suppliedRunId) {
+        throw new Error(
+            "A valid original run ID is required to resume a project."
+        );
+    }
+
+    console.log(`[PROJECT] Run ID: ${runId}`);
+
+    console.log(
+        `[PROJECT] Execution mode: ${isResume ? "RESUME" : "NEW RUN"}`
+    );
+
+    let state;
+    let plan;
+
+    // --------------------------------------------------
+    // INITIALIZE OR RECOVER PROJECT STATE
+    // --------------------------------------------------
+
+    if (isResume) {
+        console.log(
+            `[RECOVERY] Loading checkpoint for ${runId}`
+        );
+
+        const recovered = recoverProjectState({
+            projectRoot,
+            projectSlug,
+            runId
+        });
+
+        if (
+            !recovered ||
+            !recovered.state ||
+            !recovered.checkpoint ||
+            !recovered.recovery
+        ) {
+            throw new Error(
+                "Project recovery returned an invalid result."
+            );
+        }
+
+        state = recovered.state;
+        plan = state.plan;
+
+        // Preserve recovery information in the returned project state.
+        state.recovery = recovered.recovery;
+
+        // Always use original saved project details.
+        projectName = state.projectName || projectName;
+        description = state.description || description;
+
+        console.log(
+            `[RECOVERY] Checkpoint sequence: ${recovered.checkpoint.sequence}`
+        );
+
+        console.log(
+            `[RECOVERY] Restored completed tasks: ${
+                recovered.recovery.resumedTaskIds.length
+            }`
+        );
+
+        console.log(
+            `[RECOVERY] Tasks to execute again: ${
+                recovered.recovery.resetTaskIds.length
+            }`
+        );
+
+        recordEvent(projectRoot, {
+            type: "project.resumed",
+            projectName,
+            runId,
+            checkpointSequence: recovered.checkpoint.sequence,
+            resumedTaskIds: recovered.recovery.resumedTaskIds,
+            resetTaskIds: recovered.recovery.resetTaskIds,
+            invalidCompletedTasks:
+                recovered.recovery.invalidCompletedTasks
+        });
+
+    } else {
+        state = {
+            projectName,
+            projectSlug,
+            runId,
+            description,
+
+            status: "planning",
+
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+            completedAt: null,
+
+            plan: null,
+            tasks: [],
+            generatedFiles: [],
+
+            integration: createInitialIntegrationState(),
+
+            qa: createInitialQAState(),
+
+            verification: createInitialVerificationState(
+                approveFunctionalTests
+            ),
+
+            recovery: null
+        };
+
+        recordEvent(projectRoot, {
+            type: "project.started",
+            projectName,
+            runId
+        });
+    }
+
+    // --------------------------------------------------
+    // PERSISTENCE
+    // --------------------------------------------------
+
+    function persist(reason = null) {
+        state.updatedAt = new Date().toISOString();
+
+        const runningTask = state.tasks.find(
+            task => task.status === "running"
+        );
+
+        const checkpointReason = reason || (
+            runningTask
+                ? `task:${runningTask.id}:${runningTask.status}`
+                : [
+                    state.status,
+                    state.integration.status,
+                    state.qa.status,
+                    state.verification.status
+                ].join(":")
+        );
+
+        // Save checkpoint before updating dashboard state.
+        saveCheckpoint(
+            projectRoot,
+            state,
+            checkpointReason
+        );
+
+        saveProjectState(
+            projectRoot,
+            state
+        );
+    }
+
+    // --------------------------------------------------
+    // STAGE 0: PLANNING OR RESUMING
+    // --------------------------------------------------
+
+    if (!isResume) {
+        console.log(
+            `[PROJECT] Planning started: ${projectName}`
+        );
+
+        persist("planning_started");
+
+        plan = await services.createProjectPlan({
+            projectName,
+            description
+        });
+
+        if (
+            !plan ||
+            !Array.isArray(plan.tasks) ||
+            plan.tasks.length === 0
+        ) {
+            throw new Error(
+                "Planner did not produce a valid project plan."
+            );
+        }
+
+        state.plan = plan;
+        state.status = "executing";
+
+        state.tasks = plan.tasks.map(task => ({
+            ...task,
+            status: "pending",
+            result: null,
+            error: null
+        }));
+
+        recordEvent(projectRoot, {
+            type: "project.plan_created",
+            runId,
+            taskCount: plan.tasks.length,
+            technologyStack: plan.technologyStack
+        });
+
+        persist("plan_created");
+
+    } else {
+        if (
+            !plan ||
+            !Array.isArray(state.tasks) ||
+            state.tasks.length === 0
+        ) {
+            throw new Error(
+                "Recovered project does not contain a valid saved plan."
+            );
+        }
+
+        state.status = "executing";
+
+        // Persist recovery before executing unfinished agents.
+        persist("project_recovered");
+    }
+
+    // --------------------------------------------------
+    // RESTORE EXECUTION PROGRESS
+    // --------------------------------------------------
+
+    const completed = new Set(
+        state.tasks
+            .filter(task => task.status === "completed")
+            .map(task => task.id)
+    );
+
+    const summaries = buildCompletedTaskContext(
+        state.tasks
+    );
+
+    console.log(
+        `[PROJECT] Completed agents already available: ${completed.size}`
+    );
+
+    // --------------------------------------------------
+    // STAGE 1: EXECUTE SPECIALIST AGENTS
+    // --------------------------------------------------
+
+    for (const task of state.tasks) {
+        // Never regenerate validated completed tasks.
+        if (task.status === "completed") {
+            console.log(
+                `[RESUME] Skipping completed agent: ${task.agentId}`
+            );
+
+            continue;
+        }
+
+        // Normalize interrupted or unexpected task states.
+        if (task.status !== "pending") {
+            console.warn(
+                `[PROJECT] Task ${task.id} has unexpected status ` +
+                `"${task.status}". Resetting it to pending.`
+            );
+
+            task.status = "pending";
+            task.result = null;
+            task.error = null;
+        }
+
+        const taskDependencies = Array.isArray(task.dependsOn)
+            ? task.dependsOn
+            : [];
+
+        const blockedBy = taskDependencies.filter(
+            dependency => !completed.has(dependency)
+        );
+
+        console.log("[DEPENDENCY CHECK]", {
+            taskId: task.id,
+            agentId: task.agentId,
+            status: task.status,
+            dependencies: taskDependencies,
+            completed: [...completed],
+            blockedBy
+        });
+
+        // Do not execute a task until its dependencies are complete.
+        if (blockedBy.length > 0) {
+            task.status = "skipped";
+
+            task.error =
+                `Blocked by unsuccessful dependencies: ${blockedBy.join(", ")}`;
+
+            recordEvent(projectRoot, {
+                type: "task.skipped",
+                runId,
+                taskId: task.id,
+                agentId: task.agentId,
+                reason: task.error
+            });
+
+            persist();
+
+            continue;
+        }
+
+        console.log("[TASK DISPATCH]", {
+            taskId: task.id,
+            agentId: task.agentId,
+            executor: services.executePlannedTask.name
+        });
+
+        task.status = "running";
+        task.error = null;
+
+        recordEvent(projectRoot, {
+            type: "task.started",
+            runId,
+            taskId: task.id,
+            agentId: task.agentId,
+            title: task.title,
+            resumed: isResume
+        });
+
+        persist();
+
+        try {
+            const previousFiles = readPreviousAgentFiles(
+                projectRoot,
+                state.generatedFiles
+            );
+
+            const context = `
+PROJECT: ${projectName}
+
+PROJECT RUN ID:
+${runId}
+
+USER REQUIREMENT:
+${description}
+
+PROJECT SUMMARY:
+${plan.summary || "Not provided."}
+
+TECHNOLOGY STACK:
+${Array.isArray(plan.technologyStack)
+    ? plan.technologyStack.join(", ")
+    : "Not specified"}
+
+PREVIOUS COMPLETED AGENT SUMMARIES:
+${summaries.join("\n\n") || "No previous tasks."}
+
+ACTUAL FILES GENERATED BY PREVIOUS AGENTS:
+${previousFiles}
+
+EXECUTION MODE:
+${isResume
+    ? "RESUMING AN INTERRUPTED PROJECT"
+    : "NEW PROJECT"}
+
+IMPORTANT COLLABORATION RULES:
+1. Read and understand previous agent files before implementing your task.
+2. Reuse existing interfaces, names, data structures and contracts wherever appropriate.
+3. Do not contradict or unnecessarily duplicate previous implementations.
+4. If a previous implementation needs improvement, explain the required change in your summary.
+5. Generate complete, usable source files.
+6. Do not assume files have been integrated into the live application.
+7. All generated files are staged for review, not automatically deployed.
+8. Complete the assigned task, not the tasks assigned to other agents.
+`;
+
+            let result = null;
+            let recoveryError = null;
+
+            // Execute the agent, with one additional recovery round.
+            for (
+                let recoveryRound = 0;
+                recoveryRound <= MAX_AGENT_RECOVERY_ROUNDS;
+                recoveryRound++
+            ) {
+                try {
+                    if (recoveryRound > 0) {
+                        recordEvent(projectRoot, {
+                            type: "task.recovery_started",
+                            runId,
+                            taskId: task.id,
+                            agentId: task.agentId,
+                            recoveryRound,
+                            previousError:
+                                recoveryError?.message || null
+                        });
+
+                        console.warn(
+                            `[AGENT RECOVERY] ${task.agentId}: ` +
+                            `Recovery round ${recoveryRound}/` +
+                            `${MAX_AGENT_RECOVERY_ROUNDS}`
+                        );
+
+                        persist();
+
+                        await new Promise(resolve =>
+                            setTimeout(
+                                resolve,
+                                AGENT_RECOVERY_DELAY_MS
+                            )
+                        );
+                    }
+
+                    const recoveryContext = recoveryRound > 0
+                        ? context + `
+
+PREVIOUS EXECUTION FAILURE:
+${String(
+    recoveryError?.message || "Unknown execution failure"
+).slice(0, 2000)}
+
+RECOVERY INSTRUCTIONS:
+This is a recovery execution of the same assigned task.
+Complete the original task.
+Do not assume the previous attempt saved files.
+Follow all original output and file safety requirements.
+`
+                        : context;
+
+                    // Important: clear the previous attempt's result.
+                    result = null;
+
+                    console.log(
+                        "[EXECUTOR CALL]",
+                        task.agentId
+                    );
+
+                    const candidateResult =
+                        await services.executePlannedTask({
+                            task,
+                            projectContext: recoveryContext
+                        });
+
+                    if (
+                        !candidateResult ||
+                        !Array.isArray(candidateResult.files) ||
+                        candidateResult.files.length === 0
+                    ) {
+                        throw new Error(
+                            "Agent returned no usable files."
+                        );
+                    }
+
+                    if (
+                        candidateResult.files.some(
+                            file =>
+                                !file ||
+                                typeof file.path !== "string" ||
+                                !file.path.trim() ||
+                                typeof file.content !== "string"
+                        )
+                    ) {
+                        throw new Error(
+                            "Agent returned an invalid file. Every file must contain a path and string content."
+                        );
+                    }
+
+                    result = candidateResult;
+                    recoveryError = null;
+
+                    console.log("[EXECUTOR RETURN]", {
+                        agentId: task.agentId,
+                        hasResult: true,
+                        fileCount: result.files.length
+                    });
+
+                    break;
+
+                } catch (error) {
+                    recoveryError = error;
+                    result = null;
+
+                    recordEvent(projectRoot, {
+                        type: "task.recovery_attempt_failed",
+                        runId,
+                        taskId: task.id,
+                        agentId: task.agentId,
+                        recoveryRound,
+                        error: safeErrorMessage(error)
+                    });
+
+                    console.error(
+                        `[AGENT EXECUTION FAILED] ${task.agentId}: ` +
+                        `Round ${recoveryRound + 1}: ${safeErrorMessage(error)}`
+                    );
+                }
+            }
+
+            if (!result) {
+                throw recoveryError || new Error(
+                    "Agent execution failed without a result."
+                );
+            }
+
+            // Save actual generated artifacts.
+            const writtenFiles = writeAgentFiles(
+                projectRoot,
+                task.id,
+                result.files,
+                runId
+            );
+
+            if (
+                !Array.isArray(writtenFiles) ||
+                writtenFiles.length === 0
+            ) {
+                throw new Error(
+                    "Agent output was not saved as generated artifacts."
+                );
+            }
+
+            // Only now can the task be marked completed.
+            task.status = "completed";
+
+            task.result = {
+                agentName: result.agentName || task.agentId,
+                summary: result.summary || "Task completed.",
+                files: writtenFiles,
+                provider: result.provider,
+                model: result.model,
+                usage: result.usage,
+                generationAttempts: result.attempts
+            };
+
+            task.error = null;
+
+            completed.add(task.id);
+
+            summaries.push(
+                `${task.title} (${result.agentName || task.agentId}): ` +
+                `${result.summary || "Completed."}`
+            );
+
+            state.generatedFiles.push(
+                ...writtenFiles
+            );
+
+            recordEvent(projectRoot, {
+                type: "task.completed",
+                runId,
+                taskId: task.id,
+                agentId: task.agentId,
+                provider: result.provider || null,
+                model: result.model || null,
+                generationAttempts: result.attempts || null,
+                files: writtenFiles
+            });
+
+        } catch (error) {
+            task.status = "failed";
+            task.error = safeErrorMessage(error);
+            task.result = null;
+
+            completed.delete(task.id);
+
+            recordEvent(projectRoot, {
+                type: "task.failed",
+                runId,
+                taskId: task.id,
+                agentId: task.agentId,
+                error: task.error
+            });
+
+            console.error(
+                `[TASK FAILED] ${task.id}: ${task.error}`
+            );
+        }
+
+        persist();
+    }
+
+    // --------------------------------------------------
+    // STAGE 2: INTEGRATION
+    // --------------------------------------------------
+
+    const integrationGate = evaluateIntegrationGate(
+        state.tasks,
+        completed,
+        state.generatedFiles
+    );
+
+    if (integrationGate.allowed) {
+        state.status = "integrating";
+
+        state.integration = {
+            status: "running",
+            summary: null,
+            files: [],
+            error: null,
+            snapshotRunId: null
+        };
+
+        recordEvent(projectRoot, {
+            type: "integration.started",
+            runId,
+            generatedFileCount: state.generatedFiles.length,
+            resumed: isResume
+        });
+
+        persist();
+
+        console.log(
+            `[INTEGRATION] Starting integration for ${projectName}`
+        );
+
+        try {
+            const integrationResult =
+                await services.integrateProject({
+                    projectSlug,
+                    projectName,
+                    description,
+                    plan,
+                    generatedFiles: state.generatedFiles,
+                    runId
+                });
+
+            if (
+                !integrationResult ||
+                integrationResult.status !== "completed" ||
+                !Array.isArray(integrationResult.files) ||
+                integrationResult.files.length === 0
+            ) {
+                throw new Error(
+                    "Integration did not produce valid output files."
+                );
+            }
+
+            if (integrationResult.runId !== runId) {
+                throw new Error(
+                    "Integration run ID does not match the project run ID."
+                );
+            }
+
+            if (
+                !validateRunId(
+                    integrationResult.snapshotRunId
+                )
+            ) {
+                throw new Error(
+                    "Integration returned a missing or invalid snapshot ID."
+                );
+            }
+
+            state.integration = {
+                ...integrationResult,
+                status: "completed",
+                snapshotRunId: integrationResult.snapshotRunId,
+                error: null
+            };
+
+            recordEvent(projectRoot, {
+                type: "integration.completed",
+                runId,
+                snapshotRunId: state.integration.snapshotRunId,
+                status: state.integration.status,
+                files: state.integration.files,
+                summary: state.integration.summary || null
+            });
+
+            console.log(
+                `[INTEGRATION] Finished with status: ${state.integration.status}`
+            );
+
+            console.log(
+                `[INTEGRATION] Snapshot: ${state.integration.snapshotRunId}`
+            );
+
+        } catch (error) {
+            state.integration = {
+                status: "failed",
+                summary: null,
+                files: [],
+                error: safeErrorMessage(error),
+                snapshotRunId: null
+            };
+
+            recordEvent(projectRoot, {
+                type: "integration.failed",
+                runId,
+                error: state.integration.error
+            });
+
+            console.error(
+                `[INTEGRATION FAILED] ${state.integration.error}`
+            );
+        }
+
+        persist();
+
+    } else {
+        state.integration = {
+            status: "skipped",
+            summary: null,
+            files: [],
+            snapshotRunId: null,
+            error: integrationGate.missingRequiredAgents.length
+                ? (
+                    "Integration blocked. Required agents did not complete: " +
+                    integrationGate.missingRequiredAgents.join(", ")
+                )
+                : (
+                    "Integration skipped because no generated agent files are available."
+                )
+        };
+
+        recordEvent(projectRoot, {
+            type: "integration.skipped",
+            runId,
+            reason: state.integration.error
+        });
+
+        persist();
+    }
+
+    // --------------------------------------------------
+    // STAGE 3: STATIC QA AND AUTOMATED REPAIR
+    // --------------------------------------------------
+
+    if (state.integration.status === "completed") {
+        state.status = "testing";
+
+        state.qa = {
+            status: "running",
+            report: null,
+            error: null,
+            repair: null
+        };
+
+        recordEvent(projectRoot, {
+            type: "qa.started",
+            runId,
+            integrationFileCount: state.integration.files.length,
+            snapshotRunId: state.integration.snapshotRunId
+        });
+
+        persist();
+
+        console.log(
+            `[QA] Starting static QA for ${projectName}`
+        );
+
+        try {
+            const integrationSnapshotId =
+                state.integration.snapshotRunId;
+
+            let qaReport = await services.runStaticQA({
+                projectRoot,
+                runId: integrationSnapshotId,
+                integrationFiles: state.integration.files
+            });
+
+            let repairResult = {
+                status: "not_needed",
+                attempts: [],
+                qaReport,
+                integrationFiles: state.integration.files,
+                snapshotRunId: integrationSnapshotId
+            };
+
+            if (
+                !qaReport ||
+                qaReport.status !== "passed"
+            ) {
+                console.log(
+                    "[REPAIR] Initial QA failed. Starting automated repair."
+                );
+
+                state.qa.status = "repairing";
+
+                recordEvent(projectRoot, {
+                    type: "repair.started",
+                    runId,
+                    snapshotRunId: integrationSnapshotId,
+                    initialQaStatus: qaReport?.status || "invalid"
+                });
+
+                persist();
+
+                const rawRepairResult =
+                    await services.runAutomatedRepair({
+                        projectRoot,
+                        projectName,
+                        description,
+                        plan,
+                        runId,
+                        snapshotRunId: integrationSnapshotId,
+                        integrationFiles: state.integration.files,
+                        qaReport
+                    });
+
+                repairResult = normalizeRepairResult(
+                    rawRepairResult,
+                    integrationSnapshotId
+                );
+
+                if (
+                    repairResult.qaReport &&
+                    typeof repairResult.qaReport === "object"
+                ) {
+                    qaReport = repairResult.qaReport;
+                }
+
+                if (repairResult.integrationFiles.length > 0) {
+                    state.integration = {
+                        ...state.integration,
+                        files: repairResult.integrationFiles,
+                        snapshotRunId: repairResult.snapshotRunId
+                    };
+                }
+
+                recordEvent(projectRoot, {
+                    type: "repair.completed",
+                    runId,
+                    status: repairResult.status,
+                    attempts: repairResult.attempts,
+                    snapshotRunId: repairResult.snapshotRunId
+                });
+            }
+
+            if (
+                !qaReport ||
+                typeof qaReport.status !== "string"
+            ) {
+                throw new Error(
+                    "QA engine did not return a valid QA report."
+                );
+            }
+
+            state.qa = {
+                status: qaReport.status,
+                report: qaReport,
+                error: null,
+                repair: repairResult
+            };
+
+            recordEvent(projectRoot, {
+                type: "qa.completed",
+                runId,
+                snapshotRunId: state.integration.snapshotRunId,
+                status: qaReport.status,
+                summary: qaReport.summary,
+                repairAttempts: repairResult.attempts.length
+            });
+
+            console.log(
+                `[QA] Finished: ${qaReport.status} | ` +
+                `Repair attempts: ${repairResult.attempts.length}`
+            );
+
+        } catch (error) {
+            state.qa = {
+                status: "failed",
+                report: null,
+                error: safeErrorMessage(error),
+                repair: null
+            };
+
+            recordEvent(projectRoot, {
+                type: "qa.failed",
+                runId,
+                error: state.qa.error
+            });
+
+            console.error(
+                `[QA FAILED] ${state.qa.error}`
+            );
+        }
+
+        persist();
+
+    } else {
+        state.qa = {
+            status: "skipped",
+            report: null,
+            error: "QA requires successful integration.",
+            repair: null
+        };
+
+        recordEvent(projectRoot, {
+            type: "qa.skipped",
+            runId,
+            reason: state.qa.error
+        });
+
+        persist();
+    }
+
+    // --------------------------------------------------
+    // STAGE 4: APPROVED FUNCTIONAL VERIFICATION
+    // --------------------------------------------------
+
+    if (
+        state.integration.status === "completed" &&
+        state.qa.status === "passed"
+    ) {
+        const repairCycles = [];
+
+        state.status = "verifying";
+
+        state.verification = {
+            status: "running",
+            approval: approveFunctionalTests === true
+                ? "granted"
+                : "not_granted",
+            build: "not_run",
+            functionalTests: "running",
+            report: null,
+            evidence: [],
+            repairCycles
+        };
+
+        persist();
+
+        let functionalResult = null;
+
+        async function executeCurrentFunctionalTests() {
+            const snapshotId =
+                state.integration.snapshotRunId;
+
+            if (!validateRunId(snapshotId)) {
+                throw new Error(
+                    "Invalid integration snapshot before functional testing."
+                );
+            }
+
+            recordEvent(projectRoot, {
+                type: "functional_tests.started",
+                runId,
+                approved: approveFunctionalTests === true,
+                snapshotRunId: snapshotId
+            });
+
+            persist();
+
+            const result =
+                await services.runApprovedFunctionalTests({
+                    projectRoot,
+                    runId,
+                    snapshotRunId: snapshotId,
+                    integrationFiles: state.integration.files,
+                    approved: approveFunctionalTests === true,
+                    runtimeVerification: true
+                });
+
+            if (
+                !result ||
+                typeof result.status !== "string"
+            ) {
+                throw new Error(
+                    "Functional test runner returned an invalid result."
+                );
+            }
+
+            if (
+                result.snapshotRunId &&
+                result.snapshotRunId !== snapshotId
+            ) {
+                throw new Error(
+                    "Functional test result belongs to a different snapshot."
+                );
+            }
+
+            return {
+                ...result,
+                snapshotRunId: snapshotId
+            };
+        }
+
+        try {
+            // First execution against the integrated snapshot.
+            functionalResult =
+                await executeCurrentFunctionalTests();
+
+            // ------------------------------------------
+            // FUNCTIONAL FAILURE REPAIR LOOP
+            // ------------------------------------------
+
+            for (
+                let cycle = 1;
+                cycle <= MAX_FUNCTIONAL_REPAIR_CYCLES;
+                cycle++
+            ) {
+                if (functionalResult.status !== "failed") {
+                    break;
+                }
+
+                const previousSnapshotId =
+                    state.integration.snapshotRunId;
+
+                const cycleRecord = {
+                    cycle,
+                    status: "repairing",
+                    previousSnapshotId,
+                    newSnapshotId: null,
+                    repairAttempts: []
+                };
+
+                repairCycles.push(cycleRecord);
+
+                recordEvent(projectRoot, {
+                    type: "functional_repair.started",
+                    runId,
+                    cycle,
+                    snapshotRunId: previousSnapshotId
+                });
+
+                state.verification = {
+                    status: "repairing",
+                    approval: approveFunctionalTests === true
+                        ? "granted"
+                        : "not_granted",
+                    build: "not_run",
+                    functionalTests: "failed",
+                    report: functionalResult,
+                    evidence: [],
+                    repairCycles
+                };
+
+                persist();
+
+                try {
+                    let repairResult =
+                        await services.runAutomatedRepair({
+                            projectRoot,
+                            projectName,
+                            description,
+                            plan,
+                            runId,
+                            snapshotRunId: previousSnapshotId,
+                            integrationFiles: state.integration.files,
+                            qaReport: state.qa.report,
+                            functionalResult
+                        });
+
+                    if (
+                        !repairResult ||
+                        !Array.isArray(repairResult.integrationFiles)
+                    ) {
+                        throw new Error(
+                            "Repair engine returned an invalid integration result."
+                        );
+                    }
+
+                    cycleRecord.repairAttempts =
+                        Array.isArray(repairResult.attempts)
+                            ? repairResult.attempts
+                            : [];
+
+                    // A repair must create a new immutable snapshot.
+                    if (
+                        !validateRunId(repairResult.snapshotRunId) ||
+                        repairResult.snapshotRunId === previousSnapshotId
+                    ) {
+                        cycleRecord.status = "not_repaired";
+
+                        cycleRecord.error =
+                            "Repair did not produce a new valid integration snapshot.";
+
+                        recordEvent(projectRoot, {
+                            type: "functional_repair.not_repaired",
+                            runId,
+                            cycle,
+                            error: cycleRecord.error
+                        });
+
+                        break;
+                    }
+
+                    if (
+                        repairResult.integrationFiles.length === 0
+                    ) {
+                        throw new Error(
+                            "Repair produced an empty integration snapshot."
+                        );
+                    }
+
+                    // A fix for the runtime problem may trip the static QA
+                    // rules. Let the QA repair engine clean that up before
+                    // giving up on this cycle.
+                    for (
+                        let followUp = 1;
+                        followUp <= MAX_QA_FOLLOWUPS_PER_CYCLE &&
+                        repairResult.qaReport &&
+                        repairResult.qaReport.status !== "passed" &&
+                        validateRunId(repairResult.snapshotRunId);
+                        followUp++
+                    ) {
+                        const qaFix =
+                            await services.runAutomatedRepair({
+                                projectRoot,
+                                projectName,
+                                description,
+                                plan,
+                                runId,
+                                snapshotRunId: repairResult.snapshotRunId,
+                                integrationFiles: repairResult.integrationFiles,
+                                qaReport: repairResult.qaReport,
+                                functionalResult: null
+                            });
+
+                        if (
+                            !qaFix ||
+                            !Array.isArray(qaFix.integrationFiles) ||
+                            qaFix.integrationFiles.length === 0 ||
+                            !validateRunId(qaFix.snapshotRunId) ||
+                            qaFix.snapshotRunId === repairResult.snapshotRunId
+                        ) {
+                            break;
+                        }
+
+                        const mergedAttempts = [
+                            ...(repairResult.attempts || []),
+                            ...(Array.isArray(qaFix.attempts)
+                                ? qaFix.attempts
+                                : [])
+                        ];
+
+                        cycleRecord.repairAttempts = mergedAttempts;
+
+                        repairResult = {
+                            ...qaFix,
+                            attempts: mergedAttempts
+                        };
+                    }
+
+                    // Keep the latest actual snapshot visible.
+                    if (
+                        !repairResult.qaReport ||
+                        repairResult.qaReport.status !== "passed"
+                    ) {
+                        cycleRecord.status = "static_qa_failed";
+
+                        cycleRecord.newSnapshotId =
+                            repairResult.snapshotRunId;
+
+                        state.integration = {
+                            ...state.integration,
+                            files: repairResult.integrationFiles,
+                            snapshotRunId: repairResult.snapshotRunId
+                        };
+
+                        state.qa = {
+                            status: repairResult.qaReport?.status || "failed",
+                            report: repairResult.qaReport || null,
+                            error: "Static QA did not pass after functional repair.",
+                            repair: repairResult
+                        };
+
+                        recordEvent(projectRoot, {
+                            type: "functional_repair.static_qa_failed",
+                            runId,
+                            cycle,
+                            snapshotRunId: repairResult.snapshotRunId
+                        });
+
+                        persist();
+
+                        break;
+                    }
+
+                    // Adopt only a snapshot that passed static QA.
+                    state.integration = {
+                        ...state.integration,
+                        files: repairResult.integrationFiles,
+                        snapshotRunId: repairResult.snapshotRunId
+                    };
+
+                    state.qa = {
+                        status: "passed",
+                        report: repairResult.qaReport,
+                        error: null,
+                        repair: repairResult
+                    };
+
+                    cycleRecord.newSnapshotId =
+                        repairResult.snapshotRunId;
+
+                    cycleRecord.status = "static_qa_passed";
+
+                    recordEvent(projectRoot, {
+                        type: "functional_repair.snapshot_created",
+                        runId,
+                        cycle,
+                        previousSnapshotId,
+                        snapshotRunId: repairResult.snapshotRunId
+                    });
+
+                    persist();
+
+                    // Retest the new snapshot.
+                    functionalResult =
+                        await executeCurrentFunctionalTests();
+
+                    cycleRecord.functionalTestStatus =
+                        functionalResult.status;
+
+                    cycleRecord.status =
+                        functionalResult.status === "passed"
+                            ? "verified"
+                            : functionalResult.status;
+
+                    recordEvent(projectRoot, {
+                        type: "functional_repair.retested",
+                        runId,
+                        cycle,
+                        snapshotRunId: state.integration.snapshotRunId,
+                        status: functionalResult.status,
+                        summary:
+                            functionalResult.report?.summary || null
+                    });
+
+                    persist();
+
+                    if (functionalResult.status === "passed") {
+                        break;
+                    }
+
+                    // Do not automatically repair approval or unsupported
+                    // states, or functional-test infrastructure errors.
+                    if (functionalResult.status !== "failed") {
+                        break;
+                    }
+
+                } catch (repairError) {
+                    cycleRecord.status = "error";
+                    cycleRecord.error =
+                        safeErrorMessage(repairError);
+
+                    functionalResult = {
+                        status: "error",
+                        error: cycleRecord.error,
+                        snapshotRunId: state.integration.snapshotRunId
+                    };
+
+                    recordEvent(projectRoot, {
+                        type: "functional_repair.failed",
+                        runId,
+                        cycle,
+                        error: cycleRecord.error
+                    });
+
+                    console.error(
+                        `[FUNCTIONAL REPAIR] Cycle ${cycle} failed: ` +
+                        cycleRecord.error
+                    );
+
+                    break;
+                }
+            }
+
+            const verificationStatus =
+                functionalResult.status === "passed"
+                    ? "verified"
+                    : functionalResult.status === "approval_required"
+                        ? "approval_required"
+                        : functionalResult.status === "unsupported"
+                            ? "unsupported"
+                            : functionalResult.status === "failed"
+                                ? "failed"
+                                : "error";
+
+            state.verification = {
+                status: verificationStatus,
+
+                approval: approveFunctionalTests === true
+                    ? "granted"
+                    : "not_granted",
+
+                build: functionalResult.runtime
+                    ? functionalResult.runtime.status
+                    : "not_run",
+
+                runtime: functionalResult.runtime || null,
+
+                functionalTests: functionalResult.status,
+
+                report: functionalResult,
+
+                evidence: functionalResult.status === "passed"
+                    ? [{
+                        type: "native_functional_tests",
+                        snapshotRunId:
+                            state.integration.snapshotRunId,
+                        summary:
+                            functionalResult.report?.summary || null
+                    }]
+                    : [],
+
+                repairCycles
+            };
+
+            recordEvent(projectRoot, {
+                type: "functional_tests.completed",
+                runId,
+                status: functionalResult.status,
+                snapshotRunId: state.integration.snapshotRunId,
+                summary:
+                    functionalResult.report?.summary || null,
+                error: functionalResult.error || null,
+                repairCycles: repairCycles.length
+            });
+
+            console.log(
+                `[FUNCTIONAL TESTS] ${functionalResult.status}`
+            );
+
+        } catch (error) {
+            state.verification = {
+                status: "error",
+
+                approval: approveFunctionalTests === true
+                    ? "granted"
+                    : "not_granted",
+
+                build: "not_run",
+                functionalTests: "error",
+
+                report: {
+                    status: "error",
+                    error: safeErrorMessage(error)
+                },
+
+                evidence: [],
+                repairCycles
+            };
+
+            recordEvent(projectRoot, {
+                type: "functional_tests.failed",
+                runId,
+                error: safeErrorMessage(error)
+            });
+
+            console.error(
+                `[FUNCTIONAL TESTS ERROR] ${safeErrorMessage(error)}`
+            );
+        }
+
+        persist();
+
+    } else {
+        state.verification = {
+            status: "blocked",
+
+            approval: approveFunctionalTests === true
+                ? "granted"
+                : "not_granted",
+
+            build: "not_run",
+            functionalTests: "not_run",
+            report: null,
+            evidence: [],
+            repairCycles: []
+        };
+
+        persist();
+    }
+
+    // --------------------------------------------------
+    // STAGE 4B: EXPORT A CLEAN, RUNNABLE COPY
+    // --------------------------------------------------
+
+    let runnableExport = null;
+
+    if (
+        state.integration.status === "completed" &&
+        validateRunId(state.integration.snapshotRunId) &&
+        Array.isArray(state.integration.files) &&
+        state.integration.files.length > 0
+    ) {
+        try {
+            runnableExport = exportIntegratedProject({
+                projectRoot,
+                snapshotRunId: state.integration.snapshotRunId,
+                integrationFiles: state.integration.files
+            });
+
+            state.export = {
+                status: "completed",
+                path: `workspace/${projectSlug}/${runnableExport.directory}`,
+                fileCount: runnableExport.fileCount,
+                snapshotRunId: runnableExport.snapshotRunId
+            };
+
+            recordEvent(projectRoot, {
+                type: "project.exported",
+                runId,
+                path: state.export.path,
+                fileCount: runnableExport.fileCount,
+                snapshotRunId: runnableExport.snapshotRunId
+            });
+
+            console.log(
+                `[EXPORT] ${runnableExport.fileCount} files -> ` +
+                `${state.export.path}`
+            );
+
+        } catch (error) {
+            state.export = {
+                status: "failed",
+                error: safeErrorMessage(error)
+            };
+
+            console.error(
+                `[EXPORT ERROR] ${safeErrorMessage(error)}`
+            );
+        }
+
+        persist();
+    }
+
+    // --------------------------------------------------
+    // STAGE 5: FINAL PROJECT STATUS
+    // --------------------------------------------------
+
+    const failedTasks = state.tasks.filter(
+        task => task.status === "failed"
+    );
+
+    const skippedTasks = state.tasks.filter(
+        task => task.status === "skipped"
+    );
+
+    const pendingTasks = state.tasks.filter(
+        task =>
+            task.status === "pending" ||
+            task.status === "running"
+    );
+
+    if (pendingTasks.length > 0) {
+        state.status = "partially_completed";
+
+    } else if (failedTasks.length > 0) {
+        state.status = completed.size > 0
+            ? "partially_completed"
+            : "failed";
+
+    } else if (skippedTasks.length > 0) {
+        state.status = "partially_completed";
+
+    } else if (state.integration.status !== "completed") {
+        state.status = "integration_failed";
+
+    } else if (state.qa.status !== "passed") {
+        state.verification.status = "blocked";
+        state.status = "qa_failed";
+
+    } else if (state.verification.status === "verified") {
+        state.status = "completed";
+
+    } else if (
+        state.verification.functionalTests === "failed"
+    ) {
+        state.status = "functional_tests_failed";
+
+    } else if (
+        state.verification.functionalTests === "error"
+    ) {
+        state.status = "verification_failed";
+
+    } else {
+        // Approval-required and unsupported are not successful verification.
+        state.status = "verification_required";
+    }
+
+    // The execution has reached a final state, but this does not mean
+    // that the application itself passed verification.
+    state.completedAt = new Date().toISOString();
+
+    recordEvent(projectRoot, {
+        type: "project.finished",
+        runId,
+        status: state.status,
+        completedTasks: completed.size,
+        failedTasks: failedTasks.length,
+        skippedTasks: skippedTasks.length,
+        pendingTasks: pendingTasks.length,
+        integrationStatus: state.integration.status,
+        qaStatus: state.qa.status,
+        verificationStatus: state.verification.status
+    });
+
+    persist("project_finished");
+
+    console.log(
+        `[PROJECT] Finished with status: ${state.status}`
+    );
+
+    // --------------------------------------------------
+    // FINAL RESULT
+    // --------------------------------------------------
+
+    return {
+        projectName,
+        projectSlug,
+        runId,
+
+        projectPath: `workspace/${projectSlug}`,
+
+        runnablePath: state.export?.status === "completed"
+            ? state.export.path
+            : null,
+
+        export: state.export || null,
+
+        status: state.status,
+
+        totalTasks: state.tasks.length,
+        completed: completed.size,
+        failed: failedTasks.length,
+        skipped: skippedTasks.length,
+        pending: pendingTasks.length,
+
+        generatedFiles: state.generatedFiles,
+
+        integration: state.integration,
+        integrationStatus: state.integration.status,
+
+        qaStatus: state.qa.status,
+        qa: state.qa,
+
+        verification: state.verification,
+
+        repairStatus:
+            state.qa.repair?.status || "not_needed",
+
+        repair: state.qa.repair || null,
+
+        recovery: state.recovery || null,
+
+        tasks: state.tasks.map(task => ({
+            id: task.id,
+            title: task.title,
+            agentId: task.agentId,
+            status: task.status,
+            error: task.error,
+            result: task.result
+        }))
+    };
+}
+
+
+// --------------------------------------------------
+// EXPORTS
+// --------------------------------------------------
+
+module.exports = {
+    runProject,
+    evaluateIntegrationGate
+};

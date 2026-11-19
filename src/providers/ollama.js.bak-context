@@ -1,0 +1,125 @@
+async function askOllama(
+    userPrompt,
+    systemPrompt = "You are a helpful software engineering assistant.",
+    options = {}
+) {
+    const baseUrl = (
+        process.env.OLLAMA_HOST || "http://127.0.0.1:11434"
+    ).replace(/\/+$/, "");
+
+    const model =
+        options.model ||
+        process.env.OLLAMA_MODEL ||
+        "qwen2.5-coder:3b";
+
+    const timeoutMs = options.timeout || 300000;
+
+    const controller = new AbortController();
+
+    const timeout = setTimeout(
+        () => controller.abort(),
+        timeoutMs
+    );
+
+    try {
+        const requestBody = {
+            model,
+            messages: [
+                {
+                    role: "system",
+                    content: systemPrompt
+                },
+                {
+                    role: "user",
+                    content: userPrompt
+                }
+            ],
+            stream: false,
+            keep_alive: process.env.OLLAMA_KEEP_ALIVE || "5m",
+            options: {
+                temperature: options.temperature ?? 0.1,
+                num_predict: options.maxTokens || 2500
+            }
+        };
+
+        const response = await fetch(
+            `${baseUrl}/api/chat`,
+            {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json"
+                },
+                body: JSON.stringify(requestBody),
+                signal: controller.signal
+            }
+        );
+
+        let data;
+
+        try {
+            data = await response.json();
+        } catch {
+            const error = new Error(
+                `Ollama returned invalid JSON. HTTP ${response.status}`
+            );
+
+            error.provider = "ollama";
+            error.status = response.status;
+
+            throw error;
+        }
+
+        if (!response.ok) {
+            const error = new Error(
+                `Ollama HTTP ${response.status}: ${
+                    data.error || "Unknown error"
+                }`
+            );
+
+            error.provider = "ollama";
+            error.status = response.status;
+
+            throw error;
+        }
+
+        const content = data.message?.content || "";
+        const finishReason = data.done_reason || null;
+
+        return {
+            content: typeof content === "string"
+                ? content.trim()
+                : "",
+            model: data.model || model,
+            usage: {
+                promptTokens: data.prompt_eval_count || 0,
+                completionTokens: data.eval_count || 0,
+                totalDuration: data.total_duration || 0
+            },
+            finishReason,
+            truncated: finishReason === "length"
+        };
+
+    } catch (error) {
+        if (error.name === "AbortError") {
+            const timeoutError = new Error(
+                `Ollama request timed out after ${timeoutMs}ms`
+            );
+
+            timeoutError.provider = "ollama";
+            timeoutError.code = "PROVIDER_TIMEOUT";
+
+            throw timeoutError;
+        }
+
+        if (!error.provider) {
+            error.provider = "ollama";
+        }
+
+        throw error;
+
+    } finally {
+        clearTimeout(timeout);
+    }
+}
+
+module.exports = { askOllama };

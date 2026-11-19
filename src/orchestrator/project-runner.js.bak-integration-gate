@@ -1,0 +1,719 @@
+
+const fs = require("node:fs");
+const path = require("node:path");
+const { randomUUID } = require("node:crypto");
+
+const { createProjectPlan } = require("./planner");
+const { executePlannedTask } = require("./delegator");
+const { integrateProject } = require("./integration-engine");
+const { runStaticQA } = require("./qa-runner");
+const { runAutomatedRepair } = require("./repair-runner");
+
+const {
+    getProjectRoot,
+    writeAgentFiles
+} = require("../runtime/file-manager");
+
+const {
+    saveProjectState,
+    recordEvent
+} = require("../runtime/project-store");
+
+// --------------------------------------------------
+// HELPERS
+// --------------------------------------------------
+
+function slugify(value) {
+    return String(value)
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/^-|-$/g, "")
+        .slice(0, 50);
+}
+
+function readPreviousAgentFiles(projectRoot, generatedFiles) {
+    const MAX_TOTAL_CONTEXT = 30000;
+    const MAX_FILE_CONTEXT = 12000;
+
+    let totalBytes = 0;
+    const artifacts = [];
+
+    for (const file of generatedFiles) {
+        if (totalBytes >= MAX_TOTAL_CONTEXT) {
+            break;
+        }
+
+        try {
+            const absolutePath = path.resolve(projectRoot, file.path);
+            const relative = path.relative(projectRoot, absolutePath);
+
+            if (
+                !relative ||
+                relative === ".." ||
+                relative.startsWith(".." + path.sep) ||
+                path.isAbsolute(relative)
+            ) {
+                continue;
+            }
+
+            const stats = fs.lstatSync(absolutePath);
+
+            if (!stats.isFile() || stats.isSymbolicLink()) {
+                continue;
+            }
+
+            const remaining = MAX_TOTAL_CONTEXT - totalBytes;
+            const allowedBytes = Math.min(
+                MAX_FILE_CONTEXT,
+                remaining
+            );
+
+            if (stats.size > allowedBytes) {
+                artifacts.push(
+                    `FILE: ${file.path}\n` +
+                    `[File omitted: ${stats.size} bytes exceeds the remaining shared-context limit.]`
+                );
+
+                continue;
+            }
+
+            const content = fs.readFileSync(absolutePath, "utf8");
+
+            artifacts.push(
+                `FILE: ${file.path}\n` +
+                `CONTENT:\n${content}`
+            );
+
+            totalBytes += Buffer.byteLength(content, "utf8");
+
+        } catch (error) {
+            console.warn(
+                `[PROJECT] Could not read previous artifact ${file.path}: ${error.message}`
+            );
+        }
+    }
+
+    return artifacts.length
+        ? artifacts.join("\n\n--- NEXT GENERATED FILE ---\n\n")
+        : "No previous generated source files available.";
+}
+
+// --------------------------------------------------
+// MAIN PROJECT RUNNER
+// --------------------------------------------------
+
+async function runProject({ projectName, description, runId: suppliedRunId }) {
+    if (
+        typeof projectName !== "string" ||
+        !projectName.trim()
+    ) {
+        throw new Error("Please provide a valid project name.");
+    }
+
+    if (
+        typeof description !== "string" ||
+        !description.trim()
+    ) {
+        throw new Error("Please provide a project description.");
+    }
+
+    const projectSlug = slugify(projectName);
+
+    if (!projectSlug) {
+        throw new Error("Please provide a valid project name.");
+    }
+
+    const projectRoot = getProjectRoot(projectSlug);
+
+    // Every project execution receives a unique ID.
+    const runId = suppliedRunId || randomUUID();
+
+    if (
+        typeof runId !== "string" ||
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(runId)
+    ) {
+        throw new Error("Invalid project run ID.");
+    }
+
+    console.log(`[PROJECT] Run ID: ${runId}`);
+
+    const state = {
+        projectName,
+        projectSlug,
+        runId,
+        description,
+
+        status: "planning",
+
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+
+        plan: null,
+        tasks: [],
+        generatedFiles: [],
+
+        integration: {
+            status: "pending",
+            summary: null,
+            files: [],
+            error: null
+        },
+
+        qa: {
+            status: "pending",
+            report: null,
+            error: null
+        }
+    };
+
+    function persist() {
+        state.updatedAt = new Date().toISOString();
+        saveProjectState(projectRoot, state);
+    }
+
+    recordEvent(projectRoot, {
+        type: "project.started",
+        projectName,
+        runId
+    });
+
+    persist();
+
+    // --------------------------------------------------
+    // STAGE 0: PLANNING
+    // --------------------------------------------------
+
+    console.log(`[PROJECT] Planning started: ${projectName}`);
+
+    const plan = await createProjectPlan({
+        projectName,
+        description
+    });
+
+    state.plan = plan;
+    state.status = "executing";
+
+    state.tasks = plan.tasks.map(task => ({
+        ...task,
+        status: "pending",
+        result: null,
+        error: null
+    }));
+
+    recordEvent(projectRoot, {
+        type: "project.plan_created",
+        runId,
+        taskCount: plan.tasks.length,
+        technologyStack: plan.technologyStack
+    });
+
+    persist();
+
+    const completed = new Set();
+    const failed = new Set();
+    const summaries = [];
+
+    // --------------------------------------------------
+    // STAGE 1: EXECUTE SPECIALIST AGENTS
+    // --------------------------------------------------
+
+    for (const task of state.tasks) {
+        const blockedBy = task.dependsOn.filter(
+            dependency => !completed.has(dependency)
+        );
+
+        if (blockedBy.length) {
+            task.status = "skipped";
+
+            task.error =
+                `Blocked by unsuccessful dependencies: ${blockedBy.join(", ")}`;
+
+            recordEvent(projectRoot, {
+                type: "task.skipped",
+                runId,
+                taskId: task.id,
+                reason: task.error
+            });
+
+            persist();
+            continue;
+        }
+
+        task.status = "running";
+
+        recordEvent(projectRoot, {
+            type: "task.started",
+            runId,
+            taskId: task.id,
+            agentId: task.agentId,
+            title: task.title
+        });
+
+        persist();
+
+        try {
+            const previousFiles = readPreviousAgentFiles(
+                projectRoot,
+                state.generatedFiles
+            );
+
+            const context = `
+PROJECT: ${projectName}
+
+PROJECT RUN ID:
+${runId}
+
+USER REQUIREMENT:
+${description}
+
+PROJECT SUMMARY:
+${plan.summary}
+
+TECHNOLOGY STACK:
+${plan.technologyStack.join(", ")}
+
+PREVIOUS COMPLETED AGENT SUMMARIES:
+${summaries.join("\n\n") || "No previous tasks."}
+
+ACTUAL FILES GENERATED BY PREVIOUS AGENTS:
+${previousFiles}
+
+IMPORTANT COLLABORATION RULES:
+1. Read and understand the previous agent files before implementing your task.
+2. Reuse existing interfaces, names, data structures and contracts wherever appropriate.
+3. Do not contradict or unnecessarily duplicate previous implementations.
+4. If a previous implementation needs improvement, explain the required change in your summary.
+5. Generate complete, usable source files.
+6. Do not assume that files have been integrated into the live application.
+7. All generated files are staged for review, not automatically deployed.
+`;
+
+            const result = await executePlannedTask({
+                task,
+                projectContext: context
+            });
+
+            const writtenFiles = writeAgentFiles(
+                projectRoot,
+                task.id,
+                result.files,
+                runId
+            );
+
+            task.status = "completed";
+
+            task.result = {
+                agentName: result.agentName,
+                summary: result.summary,
+                files: writtenFiles,
+                model: result.model,
+                usage: result.usage
+            };
+
+            completed.add(task.id);
+
+            summaries.push(
+                `${task.title} (${result.agentName}): ${result.summary}`
+            );
+
+            state.generatedFiles.push(...writtenFiles);
+
+            recordEvent(projectRoot, {
+                type: "task.completed",
+                runId,
+                taskId: task.id,
+                agentId: task.agentId,
+                files: writtenFiles
+            });
+
+        } catch (error) {
+            task.status = "failed";
+            task.error = error.message;
+
+            failed.add(task.id);
+
+            recordEvent(projectRoot, {
+                type: "task.failed",
+                runId,
+                taskId: task.id,
+                agentId: task.agentId,
+                error: error.message
+            });
+
+            console.error(
+                `[TASK FAILED] ${task.id}: ${error.message}`
+            );
+        }
+
+        persist();
+    }
+
+    // --------------------------------------------------
+    // STAGE 2: INTEGRATION
+    // --------------------------------------------------
+
+    // Only core development agents are required for integration.
+    // QA, Security and DevOps remain valuable but are not integration blockers.
+    const requiredIntegrationAgents = new Set([
+        "business-analyst",
+        "solution-architect",
+        "backend-developer",
+        "frontend-developer",
+        "integration-engineer"
+    ]);
+
+    const completedAgentIds = new Set(
+        state.tasks
+            .filter(task => completed.has(task.id))
+            .map(task => task.agentId)
+    );
+
+    const missingRequiredAgents = [
+        ...requiredIntegrationAgents
+    ].filter(agentId => !completedAgentIds.has(agentId));
+
+    const canIntegrate =
+        state.generatedFiles.length > 0 &&
+        missingRequiredAgents.length === 0;
+
+    if (canIntegrate) {
+        state.status = "integrating";
+
+        state.integration = {
+            status: "running",
+            summary: null,
+            files: [],
+            error: null
+        };
+
+        recordEvent(projectRoot, {
+            type: "integration.started",
+            runId,
+            generatedFileCount: state.generatedFiles.length
+        });
+
+        persist();
+
+        console.log(
+            `[INTEGRATION] Starting integration for ${projectName}`
+        );
+
+        try {
+            const integrationResult = await integrateProject({
+                projectSlug,
+                projectName,
+                description,
+                plan,
+                generatedFiles: state.generatedFiles,
+                runId
+            });
+
+            if (
+                !integrationResult ||
+                integrationResult.status !== "completed" ||
+                !Array.isArray(integrationResult.files) ||
+                integrationResult.files.length === 0
+            ) {
+                throw new Error(
+                    "Integration did not produce valid output files."
+                );
+            }
+
+            // Verify the integration run ID matches this project run.
+            if (
+                integrationResult.runId &&
+                integrationResult.runId !== runId
+            ) {
+                throw new Error(
+                    "Integration run ID does not match the project run ID."
+                );
+            }
+
+            state.integration = {
+                ...integrationResult,
+                status: "completed",
+                error: null
+            };
+
+            recordEvent(projectRoot, {
+                type: "integration.completed",
+                runId,
+                status: state.integration.status,
+                files: state.integration.files,
+                summary: state.integration.summary || null
+            });
+
+            console.log(
+                `[INTEGRATION] Finished with status: ${state.integration.status}`
+            );
+
+        } catch (error) {
+            state.integration = {
+                status: "failed",
+                summary: null,
+                files: [],
+                error: error.message
+            };
+
+            recordEvent(projectRoot, {
+                type: "integration.failed",
+                runId,
+                error: error.message
+            });
+
+            console.error(
+                `[INTEGRATION FAILED] ${error.message}`
+            );
+        }
+
+        persist();
+
+    } else {
+        state.integration = {
+            status: "skipped",
+            summary: null,
+            files: [],
+            error: missingRequiredAgents.length
+                ? `Integration blocked. Required agents did not complete: ${missingRequiredAgents.join(", ")}`
+                : "Integration skipped because no generated agent files are available."
+        };
+
+        recordEvent(projectRoot, {
+            type: "integration.skipped",
+            runId,
+            reason: state.integration.error
+        });
+
+        persist();
+    }
+
+    // --------------------------------------------------
+
+    // --------------------------------------------------
+    // STAGE 3: STATIC QA + AUTOMATED REPAIR
+    // --------------------------------------------------
+
+    if (state.integration.status === "completed") {
+        state.status = "testing";
+
+        state.qa = {
+            status: "running",
+            report: null,
+            error: null,
+            repair: null
+        };
+
+        recordEvent(projectRoot, {
+            type: "qa.started",
+            runId,
+            integrationFileCount: state.integration.files.length
+        });
+
+        persist();
+
+        console.log(`[QA] Starting static QA for ${projectName}`);
+
+        try {
+            let qaReport = await runStaticQA({
+                projectRoot,
+                runId,
+                integrationFiles: state.integration.files
+            });
+
+            let repairResult = {
+                status: "not_needed",
+                attempts: [],
+                qaReport,
+                integrationFiles: state.integration.files,
+                snapshotRunId: runId
+            };
+
+            // Repair only when the first QA run fails.
+            if (qaReport.status !== "passed") {
+                console.log("[REPAIR] Initial QA failed. Starting automated repair.");
+
+                state.qa.status = "repairing";
+
+                recordEvent(projectRoot, {
+                    type: "repair.started",
+                    runId,
+                    initialQaStatus: qaReport.status
+                });
+
+                persist();
+
+                repairResult = await runAutomatedRepair({
+                    projectRoot,
+                    projectName,
+                    description,
+                    plan,
+                    runId,
+                    integrationFiles: state.integration.files,
+                    qaReport
+                });
+
+                qaReport = repairResult.qaReport || qaReport;
+
+                // Point the final project state to the latest immutable snapshot.
+                if (
+                    Array.isArray(repairResult.integrationFiles) &&
+                    repairResult.integrationFiles.length > 0
+                ) {
+                    state.integration = {
+                        ...state.integration,
+                        files: repairResult.integrationFiles,
+                        snapshotRunId: repairResult.snapshotRunId
+                    };
+                }
+
+                recordEvent(projectRoot, {
+                    type: "repair.completed",
+                    runId,
+                    status: repairResult.status,
+                    attempts: repairResult.attempts,
+                    snapshotRunId: repairResult.snapshotRunId
+                });
+            }
+
+            state.qa = {
+                status: qaReport.status,
+                report: qaReport,
+                error: null,
+                repair: repairResult
+            };
+
+            recordEvent(projectRoot, {
+                type: "qa.completed",
+                runId,
+                status: qaReport.status,
+                summary: qaReport.summary,
+                repairAttempts: repairResult.attempts.length
+            });
+
+            console.log(
+                `[QA] Finished: ${qaReport.status} | ` +
+                `Repair attempts: ${repairResult.attempts.length}`
+            );
+
+        } catch (error) {
+            state.qa = {
+                status: "failed",
+                report: null,
+                error: error.message,
+                repair: null
+            };
+
+            recordEvent(projectRoot, {
+                type: "qa.failed",
+                runId,
+                error: error.message
+            });
+
+            console.error(`[QA FAILED] ${error.message}`);
+        }
+
+        persist();
+
+    } else {
+        state.qa = {
+            status: "skipped",
+            report: null,
+            error: "QA requires successful integration.",
+            repair: null
+        };
+
+        recordEvent(projectRoot, {
+            type: "qa.skipped",
+            runId,
+            reason: state.qa.error
+        });
+
+        persist();
+    }
+
+    // STAGE 4: FINAL PROJECT STATUS
+    // --------------------------------------------------
+
+    if (failed.size > 0) {
+        state.status = completed.size > 0
+            ? "partially_completed"
+            : "failed";
+
+    } else if (state.integration.status !== "completed") {
+        state.status = "integration_failed";
+
+    } else if (state.qa.status === "passed") {
+        state.status = "integration_completed";
+
+    } else {
+        state.status = "qa_failed";
+    }
+
+    state.completedAt = new Date().toISOString();
+
+    recordEvent(projectRoot, {
+        type: "project.finished",
+        runId,
+        status: state.status,
+        completedTasks: completed.size,
+        failedTasks: state.tasks.filter(
+            task => task.status === "failed"
+        ).length,
+        skippedTasks: state.tasks.filter(
+            task => task.status === "skipped"
+        ).length,
+        integrationStatus: state.integration.status,
+        qaStatus: state.qa.status
+    });
+
+    persist();
+
+    console.log(`[PROJECT] Finished with status: ${state.status}`);
+
+    // --------------------------------------------------
+    // FINAL RESULT
+    // --------------------------------------------------
+
+    return {
+        projectName,
+        projectSlug,
+        runId,
+
+        projectPath: `workspace/${projectSlug}`,
+        status: state.status,
+
+        totalTasks: state.tasks.length,
+        completed: completed.size,
+
+        failed: state.tasks.filter(
+            task => task.status === "failed"
+        ).length,
+
+        skipped: state.tasks.filter(
+            task => task.status === "skipped"
+        ).length,
+
+        generatedFiles: state.generatedFiles,
+
+        integration: state.integration,
+        integrationStatus: state.integration.status,
+
+        qaStatus: state.qa.status,
+        qa: state.qa,
+        repairStatus: state.qa.repair?.status || "not_needed",
+        repair: state.qa.repair || null,
+
+        tasks: state.tasks.map(task => ({
+            id: task.id,
+            title: task.title,
+            agentId: task.agentId,
+            status: task.status,
+            error: task.error,
+            result: task.result
+        }))
+    };
+}
+
+module.exports = {
+    runProject
+};

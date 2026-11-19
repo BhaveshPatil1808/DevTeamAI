@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Dev Team | Workspace</title>
+    <link rel="stylesheet" href="/styles.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+</head>
+<body>
+<div class="app">
+
+    <aside class="sidebar">
+        <div class="brand">
+            <div class="brand-icon">✦</div>
+            <div>
+                <h2>DevTeam<span>AI</span></h2>
+                <small>AI Engineering Workspace</small>
+            </div>
+        </div>
+
+        <div class="workspace-label">WORKSPACE</div>
+        <nav>
+            <a class="nav-link active" href="#overview">▦ <span>Overview</span></a>
+            <a class="nav-link" href="#agents">◈ <span>AI Agents</span></a>
+            <a class="nav-link" href="#chat">▤ <span>Team Chat</span></a>
+            <a class="nav-link" href="#activity">◷ <span>Activity</span></a>
+            <a class="nav-link" href="#projects">▣ <span>Projects</span></a>
+        </nav>
+
+        <div class="sidebar-bottom">
+            <div class="provider-card">
+                <div class="provider-heading">
+                    <span class="status-dot"></span>
+                    AI PROVIDER
+                </div>
+                <strong>OpenRouter</strong>
+                <small>Free model routing</small>
+                <div class="provider-model">openrouter/free</div>
+            </div>
+            <div class="profile">
+                <div class="avatar">B</div>
+                <div><strong>Developer</strong><small>Workspace owner</small></div>
+                <span class="profile-menu">•••</span>
+            </div>
+        </div>
+    </aside>
+
+    <main class="main">
+        <header class="topbar">
+            <div>
+                <div class="breadcrumb">Workspace / <strong>Overview</strong></div>
+                <h1>AI Engineering Workspace</h1>
+            </div>
+            <div class="top-actions">
+                <span class="connection"><span class="status-dot"></span> UI Online</span>
+                <button class="icon-button" title="Notifications">♧</button>
+                <button class="new-project" onclick="document.querySelector('#buildProject').scrollIntoView({behavior:'smooth'})">＋ New Project</button>
+            </div>
+        </header>
+
+        <section id="overview" class="welcome">
+            <div>
+                <div class="eyebrow">YOUR AI DEVELOPMENT TEAM</div>
+                <h2>Build something <span>amazing.</span></h2>
+                <p>Describe your idea. Your AI engineering team will help turn it into a real project.</p>
+            </div>
+            <div class="welcome-symbol">✳</div>
+        </section>
+
+
+        <section id="buildProject" class="section build-section">
+            <div class="panel">
+                <div class="panel-heading">
+                    <div>
+                        <h2>Build a Real Project</h2>
+                        <p>Start the specialist-agent workflow. Team Chat remains separate.</p>
+                    </div>
+                    <span class="section-tag">PROJECT EXECUTION</span>
+                </div>
+
+                <form id="projectRunForm" class="project-run-form">
+                    <label for="projectNameInput">Project name</label>
+                    <input id="projectNameInput" maxlength="80"
+                           placeholder="e.g. TaskFlow" required>
+
+                    <label for="projectDescriptionInput">What should your AI team build?</label>
+                    <textarea id="projectDescriptionInput" rows="5" maxlength="8000"
+                              placeholder="Describe the features, users, data, workflows and preferred technology..."
+                              required></textarea>
+
+                    <label class="verification-approval" for="approveFunctionalTests">
+                        <input
+                            id="approveFunctionalTests"
+                            type="checkbox"
+                            checked
+                        >
+                        I approve installing dependencies (npm install) and starting
+                        the generated application in a temporary folder so DevTeamAI
+                        can verify it really runs and repair it until it does.
+                        API keys are not exposed to the generated code.
+                        This is not a deployment approval.
+                    </label>
+
+                    <div class="project-run-actions">
+                        <span id="projectRunMessage">No project execution running.</span>
+                        <button type="submit" id="projectRunButton">Start AI Build →</button>
+                    </div>
+                </form>
+
+                <div id="projectProgress" class="project-progress" hidden>
+                    <div class="project-progress-heading">
+                        <div>
+                            <strong id="projectProgressName">Project</strong>
+                            <span id="projectProgressStatus">Planning</span>
+                        </div>
+                        <span id="projectProgressCount">0 / 9 agents</span>
+                    </div>
+
+                    <div class="progress-track">
+                        <div id="projectProgressBar" class="progress-fill"></div>
+                    </div>
+
+                    <div class="project-stage-grid">
+                        <div><span>Integration</span><strong id="integrationStatus">Pending</strong></div>
+                        <div><span>Quality assurance</span><strong id="qaStatus">Pending</strong></div>
+                        <div><span>Generated files</span><strong id="generatedFileCount">0</strong></div>
+                    </div>
+
+                    <div id="projectProgressDetails" class="project-progress-details"></div>
+                </div>
+            </div>
+        </section>
+
+        <section class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-top"><span>Total Agents</span><span class="stat-icon purple">◈</span></div>
+                <strong>10</strong><small>Specialist AI roles</small>
+            </div>
+            <div class="stat-card">
+                <div class="stat-top"><span>Active Tasks</span><span class="stat-icon blue">◷</span></div>
+                <strong id="activeTasks">0</strong><small>Currently running</small>
+            </div>
+            <div class="stat-card">
+                <div class="stat-top"><span>Projects</span><span class="stat-icon green">▣</span></div>
+                <strong id="projectCount">0</strong><small>Created in this session</small>
+            </div>
+            <div class="stat-card">
+                <div class="stat-top"><span>AI Provider</span><span class="stat-icon orange">✦</span></div>
+                <strong class="provider-stat">Free</strong><small>OpenRouter routing</small>
+            </div>
+        </section>
+
+        <section id="agents" class="section">
+            <div class="section-heading">
+                <div><h2>Your AI Team</h2><p>10 specialists ready to collaborate</p></div>
+                <span class="section-tag">10 MEMBERS</span>
+            </div>
+            <div id="agentGrid" class="agent-grid"></div>
+        </section>
+
+        <section class="workspace-grid">
+            <div id="chat" class="panel chat-panel">
+                <div class="panel-heading">
+                    <div><h2>Team Chat</h2><p>Talk to your AI Project Manager</p></div>
+                    <span class="online-label"><span class="status-dot"></span> Ready</span>
+                </div>
+
+                <div id="messages" class="messages">
+                    <div class="message assistant-message">
+                        <div class="message-avatar">✦</div>
+                        <div class="message-content">
+                            <strong>AI Project Manager</strong>
+                            <p>Hey! I'm your AI Project Manager. Describe the application you want to build, and I'll help coordinate the specialist agents.</p>
+                            <div class="suggestion-list">
+                                <button class="suggestion" data-prompt="Build a SAP CAP Student Management application with CRUD operations and a Fiori UI.">Build a SAP CAP application</button>
+                                <button class="suggestion" data-prompt="Build a full-stack application with authentication, database and dashboard.">Build a full-stack application</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <form id="chatForm" class="chat-form">
+                    <textarea id="promptInput" placeholder="Describe the project you want your AI team to build..." rows="2"></textarea>
+                    <div class="chat-form-bottom">
+                        <span>Enter to send · Shift + Enter for new line</span>
+                        <button type="submit" id="sendButton">Send Request ↑</button>
+                    </div>
+                </form>
+                <div class="prototype-note">Team Chat is for discussion. Use Build a Real Project to start agent execution.</div>
+            </div>
+
+            <div id="activity" class="panel activity-panel">
+                <div class="panel-heading">
+                    <div><h2>Team Activity</h2><p>Recent workspace events</p></div>
+                    <span class="live-tag">LIVE UI</span>
+                </div>
+                <div id="activityList" class="activity-list">
+                    <div class="empty-activity">
+                        <div>◷</div>
+                        <strong>No activity yet</strong>
+                        <p>Your team activity will appear here.</p>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <section id="projects" class="section projects-section">
+            <div class="section-heading">
+                <div><h2>Recent Projects</h2><p>Your generated applications</p></div>
+            </div>
+            <div id="projectList" class="project-empty">
+                <div>▣</div>
+                <strong>No projects created in this session</strong>
+                <p>Submit a project request in Team Chat to get started.</p>
+            </div>
+        </section>
+
+        <footer>DevTeamAI · Built with Node.js and OpenRouter · AI Engineering Workspace</footer>
+    </main>
+</div>
+<script src="/app.js"></script>
+</body>
+</html>

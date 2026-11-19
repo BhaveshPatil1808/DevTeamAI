@@ -1,0 +1,19 @@
+{
+  "name": "ai-coding-agent",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "start": "node src/ui/server.js",
+    "legacy-cap-template": "node src/index.js",
+    "test": "node scripts/run-tests.js",
+    "test-ai": "node src/test-ollama.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18.17"
+  }
+}
