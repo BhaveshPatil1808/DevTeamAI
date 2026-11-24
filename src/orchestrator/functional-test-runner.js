@@ -8,7 +8,7 @@ const { spawn } = require("node:child_process");
 const { buildRestrictedInvocation, buildRestrictedEnv, RestrictedExecutionUnavailable } = require("./restricted-execution");
 
 const { verifyRuntime } = require("./runtime-verifier");
-
+const { parseTestCaseCounts } = require("./test-case-parser");
 const TEST_TIMEOUT_MS = 15 * 60 * 1000;
 const MAX_OUTPUT_BYTES = 512 * 1024;
 const MAX_FILES = 100;
@@ -405,7 +405,7 @@ function analyzeProject(fileMap) {
                 id: "go-native-tests",
                 stack: "go",
                 command: "go",
-                args: ["test", "./..."],
+                args: ["test", "-json", "./..."],
                 testFiles: goTests
             });
         }
@@ -689,7 +689,8 @@ function runCommand({
                 signal,
                 error: code === 0
                     ? null
-                    : `Test command exited with code ${code}.`
+                    : `Test command exited with code ${code}.`,
+                testCases: parseTestCaseCounts(strategyId, stdout, stderr),
             });
         });
     });
@@ -1063,6 +1064,8 @@ async function runApprovedFunctionalTests({
                 testsSkipped: 0,
                 testsPassed: 0,
                 testsFailed: 0,
+                testCases: null,
+                testCaseEvidence: [],
                 results: []
             },
             error:
@@ -1153,6 +1156,41 @@ async function runApprovedFunctionalTests({
     const nativeResults = executionResults.filter(
         item => item.strategy !== "runtime-verification"
     );
+    const testCaseEvidence = nativeResults.map(item => ({
+    strategy: item.strategy,
+    status: item.status,
+    ...(item.testCases || {
+        measured: false,
+        executed: null,
+        passed: null,
+        failed: null,
+        skipped: null,
+        source: null,
+        reason: "No test-case evidence was returned."
+    })
+}));
+
+const allTestCasesMeasured =
+    nativeResults.length > 0 &&
+    testCaseEvidence.every(item => item.measured === true);
+
+const testCases = allTestCasesMeasured
+    ? {
+        measured: true,
+        executed: testCaseEvidence.reduce(
+            (sum, item) => sum + item.executed, 0
+        ),
+        passed: testCaseEvidence.reduce(
+            (sum, item) => sum + item.passed, 0
+        ),
+        failed: testCaseEvidence.reduce(
+            (sum, item) => sum + item.failed, 0
+        ),
+        skipped: testCaseEvidence.reduce(
+            (sum, item) => sum + item.skipped, 0
+        )
+    }
+    : null;
 
     const failedResults = executionResults.filter(
         item => item.status === "failed"
@@ -1224,6 +1262,8 @@ async function runApprovedFunctionalTests({
         testsSkipped,
         testsPassed,
         testsFailed,
+        testCases,
+testCaseEvidence,
         results: executionResults
     };
 

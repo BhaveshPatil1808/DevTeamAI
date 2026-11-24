@@ -11,7 +11,7 @@ const { integrateProject } = require("./integration-engine");
 const { runStaticQA } = require("./qa-runner");
 const { runAutomatedRepair } = require("./repair-runner");
 const { runApprovedFunctionalTests } = require("./functional-test-runner");
-
+const { evaluateAccuracy } = require("./accuracy-evaluator");
 const {
     getProjectRoot,
     writeAgentFiles
@@ -368,6 +368,7 @@ async function executeStaticQA({
 // FUNCTIONAL VERIFICATION GATE
 // --------------------------------------------------
 
+
 function validateFunctionalTestResult(result, expectedSnapshotId) {
     if (!result || typeof result !== "object") {
         throw new Error("Functional test runner returned an invalid result.");
@@ -439,10 +440,142 @@ function validateFunctionalTestResult(result, expectedSnapshotId) {
                 "Runtime verification did not pass."
             );
         }
+
+        // Validate structured test-case evidence.
+        const testCases = report.testCases;
+        const evidence = report.testCaseEvidence;
+
+        const isValidCounter = value =>
+            Number.isSafeInteger(value) && value >= 0;
+
+        const isValidTestCaseRecord = item =>
+            item &&
+            typeof item === "object" &&
+            item.measured === true &&
+            isValidCounter(item.executed) &&
+            isValidCounter(item.passed) &&
+            isValidCounter(item.failed) &&
+            isValidCounter(item.skipped) &&
+            item.executed > 0 &&
+            item.passed + item.failed + item.skipped === item.executed &&
+            item.failed === 0 &&
+            typeof item.source === "string" &&
+            item.source.trim().length > 0;
+
+        if (
+            !testCases ||
+            typeof testCases !== "object" ||
+            testCases.measured !== true
+        ) {
+            throw new Error(
+                "Functional verification is missing measured test-case counts."
+            );
+        }
+
+        if (
+            !isValidCounter(testCases.executed) ||
+            !isValidCounter(testCases.passed) ||
+            !isValidCounter(testCases.failed) ||
+            !isValidCounter(testCases.skipped) ||
+            testCases.executed <= 0 ||
+            testCases.passed + testCases.failed + testCases.skipped !==
+                testCases.executed ||
+            testCases.failed !== 0
+        ) {
+            throw new Error(
+                "Aggregate test-case counters are invalid or inconsistent."
+            );
+        }
+
+        if (!Array.isArray(evidence) || evidence.length === 0) {
+            throw new Error(
+                "Per-strategy test-case evidence is missing."
+            );
+        }
+
+        const nativeResults = report.results.filter(
+            item => item.strategy !== "runtime-verification"
+        );
+
+        if (
+            nativeResults.length === 0 ||
+            evidence.length !== nativeResults.length
+        ) {
+            throw new Error(
+                "Test-case evidence does not match the executed native strategies."
+            );
+        }
+
+        const nativeStrategies = new Set(
+            nativeResults.map(item => item.strategy)
+        );
+
+        const evidenceStrategies = new Set();
+
+        for (const item of evidence) {
+            if (
+                !isValidTestCaseRecord(item) ||
+                typeof item.strategy !== "string" ||
+                item.status !== "passed" ||
+                !nativeStrategies.has(item.strategy) ||
+                evidenceStrategies.has(item.strategy)
+            ) {
+                throw new Error(
+                    "A native test strategy has missing, invalid, or duplicate test-case evidence."
+                );
+            }
+
+            evidenceStrategies.add(item.strategy);
+        }
+
+        // Ensure each evidence record corresponds to a passed native result.
+        for (const nativeResult of nativeResults) {
+            const matchingEvidence = evidence.find(
+                item => item.strategy === nativeResult.strategy
+            );
+
+            if (
+                !matchingEvidence ||
+                nativeResult.status !== "passed"
+            ) {
+                throw new Error(
+                    "Native test result and structured evidence do not match."
+                );
+            }
+        }
+
+        // Recalculate aggregate counts from individual strategies.
+        const calculated = evidence.reduce(
+            (totals, item) => {
+                totals.executed += item.executed;
+                totals.passed += item.passed;
+                totals.failed += item.failed;
+                totals.skipped += item.skipped;
+                return totals;
+            },
+            {
+                executed: 0,
+                passed: 0,
+                failed: 0,
+                skipped: 0
+            }
+        );
+
+        if (
+            calculated.executed !== testCases.executed ||
+            calculated.passed !== testCases.passed ||
+            calculated.failed !== testCases.failed ||
+            calculated.skipped !== testCases.skipped
+        ) {
+            throw new Error(
+                "Aggregate test-case counts do not match per-strategy evidence."
+            );
+        }
     }
 
     return result;
 }
+
 
 async function executeCurrentFunctionalTests({
     services,
@@ -834,6 +967,7 @@ async function runProject({
             approveFunctionalTests
         );
         state.export = createInitialExportState();
+        state.accuracy = null;
 
         projectName = state.projectName || projectName;
         description = state.description || description;
@@ -874,6 +1008,7 @@ async function runProject({
                 approveFunctionalTests
             ),
             export: createInitialExportState(),
+            accuracy: null,
             recovery: null
         };
 
@@ -1800,6 +1935,47 @@ Follow all original output and file safety requirements.
     persist("export_evaluated");
 
     // --------------------------------------------------
+// STAGE 5.5: EVIDENCE-BASED ACCURACY
+// --------------------------------------------------
+
+try {
+    state.accuracy = evaluateAccuracy({
+        plan,
+        integration: state.integration,
+        qa: state.qa,
+        verification: state.verification,
+        export: state.export,
+        snapshotRunId: state.integration.snapshotRunId
+    });
+
+    recordEvent(projectRoot, {
+        type: "project.accuracy_evaluated",
+        runId,
+        snapshotRunId: state.integration.snapshotRunId,
+        accuracyStatus: state.accuracy.status,
+        accuracyScore: state.accuracy.score,
+        unmeasured: state.accuracy.unmeasured
+    });
+
+    console.log(
+        `[ACCURACY] Status: ${state.accuracy.status} | ` +
+        `Score: ${state.accuracy.score ?? "NOT MEASURED"}`
+    );
+} catch (error) {
+    state.accuracy = {
+        status: "error",
+        score: null,
+        error: safeErrorMessage(error)
+    };
+
+    console.error(
+        `[ACCURACY ERROR] ${state.accuracy.error}`
+    );
+}
+
+persist("accuracy_evaluated");
+
+    // --------------------------------------------------
     // STAGE 6: FINAL STATUS
     // --------------------------------------------------
 
@@ -1896,6 +2072,7 @@ Follow all original output and file safety requirements.
             : null,
 
         export: state.export,
+        accuracy: state.accuracy,
         status: state.status,
 
         totalTasks: state.tasks.length,

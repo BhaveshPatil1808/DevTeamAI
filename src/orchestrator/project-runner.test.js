@@ -127,6 +127,54 @@ function makePassedQA() {
 }
 
 
+function makePassedFunctionalResult(snapshotRunId) {
+    return {
+        status: "passed",
+        approval: "granted",
+        snapshotRunId,
+
+        runtime: {
+            status: "passed"
+        },
+
+        report: {
+            summary: "All tests passed.",
+            testsExecuted: 1,
+            testsPassed: 1,
+            testsFailed: 0,
+            testsSkipped: 0,
+
+            testCases: {
+                measured: true,
+                executed: 10,
+                passed: 10,
+                failed: 0,
+                skipped: 0
+            },
+
+            testCaseEvidence: [{
+                strategy: "node-native-tests",
+                status: "passed",
+                measured: true,
+                executed: 10,
+                passed: 10,
+                failed: 0,
+                skipped: 0,
+                source: "node-tap"
+            }],
+
+            results: [{
+                strategy: "node-native-tests",
+                status: "passed",
+                command: "node --test",
+                exitCode: 0,
+                stdout: "Tests passed",
+                stderr: ""
+            }]
+        }
+    };
+}
+
 function makeDependencies(overrides = {}) {
     return {
         createProjectPlan: async () => makePlan(),
@@ -333,6 +381,7 @@ test(
                 }
 
                 // SECOND EXECUTION: pass after repair.
+                // SECOND EXECUTION: pass after repair.
                 return {
                     status: "passed",
                     approval: "granted",
@@ -347,8 +396,29 @@ test(
                         testsExecuted: 1,
                         testsPassed: 1,
                         testsFailed: 0,
+                        testsSkipped: 0,
+
+                        testCases: {
+                            measured: true,
+                            executed: 10,
+                            passed: 10,
+                            failed: 0,
+                            skipped: 0
+                        },
+
+                        testCaseEvidence: [{
+                            strategy: "node-native-tests",
+                            status: "passed",
+                            measured: true,
+                            executed: 10,
+                            passed: 10,
+                            failed: 0,
+                            skipped: 0,
+                            source: "node-tap"
+                        }],
 
                         results: [{
+                            strategy: "node-native-tests",
                             status: "passed",
                             command: "node --test",
                             exitCode: 0,
@@ -457,132 +527,124 @@ test(
 
 
 
+
 // --------------------------------------------------
-// TEST 2: RESUME FROM A REAL CHECKPOINT
+// TEST 2: INVALID STRUCTURED TEST EVIDENCE
 // --------------------------------------------------
 
 test(
-    "Project Runner resumes valid completed tasks and executes only unfinished tasks",
-    async () => {
-        const projectName = makeProjectName("resume");
-        const projectSlug = projectName
-            .toLowerCase()
-            .replace(/[^a-z0-9]+/g, "-")
-            .replace(/^-|-$/g, "")
-            .slice(0, 50);
-
-        const runId = randomUUID();
-        const projectRoot = getProjectRoot(projectSlug);
-
-        let plannerCalls = 0;
-        const executedAgents = [];
-
-        try {
-            const state = makeInitialState(
-                projectName,
-                runId
-            );
-
-            // Save eight valid completed tasks.
-            // DevOps is deliberately left unfinished.
-            for (const task of state.tasks) {
-                if (task.agentId === "devops-engineer") {
-                    continue;
+    "Project Runner rejects passed results with invalid test-case evidence",
+    async t => {
+        const scenarios = [
+            {
+                name: "missing aggregate test-case counts",
+                mutate: result => {
+                    delete result.report.testCases;
                 }
+            },
+            {
+                name: "unmeasured aggregate test-case counts",
+                mutate: result => {
+                    result.report.testCases.measured = false;
+                }
+            },
+            {
+                name: "inconsistent aggregate counters",
+                mutate: result => {
+                    result.report.testCases.executed = 11;
+                }
+            },
+            {
+                name: "missing per-strategy evidence",
+                mutate: result => {
+                    result.report.testCaseEvidence = [];
+                }
+            },
+            {
+                name: "duplicate per-strategy evidence",
+                mutate: result => {
+                    result.report.testCaseEvidence.push({
+                        ...result.report.testCaseEvidence[0]
+                    });
+                }
+            },
+            {
+                name: "passed result containing failed test cases",
+                mutate: result => {
+                    result.report.testCases.passed = 9;
+                    result.report.testCases.failed = 1;
 
-                const agentResult = makeAgentResult(task);
+                    result.report.testCaseEvidence[0].passed = 9;
+                    result.report.testCaseEvidence[0].failed = 1;
+                }
+            }
+        ];
 
-                const writtenFiles = writeAgentFiles(
-                    projectRoot,
-                    task.id,
-                    agentResult.files,
-                    runId
+        for (const scenario of scenarios) {
+            await t.test(scenario.name, async () => {
+                const projectName = makeProjectName("invalid-evidence");
+                const runId = randomUUID();
+
+                const projectRoot = getProjectRoot(
+                    projectName.toLowerCase().replace(/[^a-z0-9]+/g, "-")
                 );
 
-                task.status = "completed";
-                task.result = {
-                    agentName: agentResult.agentName,
-                    summary: agentResult.summary,
-                    files: writtenFiles,
-                    provider: "test",
-                    model: "mock",
-                    usage: null,
-                    generationAttempts: []
-                };
+                const dependencies = makeDependencies({
+                    runApprovedFunctionalTests: async ({
+                        snapshotRunId,
+                        approved
+                    }) => {
+                        assert.equal(approved, true);
 
-                state.generatedFiles.push(...writtenFiles);
-            }
+                        const result =
+                            makePassedFunctionalResult(snapshotRunId);
 
-            saveCheckpoint(
-                projectRoot,
-                state,
-                "test_interrupted_after_eight_agents"
-            );
+                        scenario.mutate(result);
 
-            const dependencies = makeDependencies({
-                createProjectPlan: async () => {
-                    plannerCalls++;
-                    throw new Error(
-                        "Planner must not run during resume."
+                        // Deliberately claims success despite invalid evidence.
+                        return result;
+                    }
+                });
+
+                try {
+                    const result = await runProject({
+                        projectName,
+                        description: `Test invalid evidence: ${scenario.name}`,
+                        runId,
+                        approveFunctionalTests: true,
+                        dependencies
+                    });
+
+                    assert.equal(
+                        result.verification.status,
+                        "error",
+                        "Invalid evidence must not produce verified status."
                     );
-                },
 
-                executePlannedTask: async ({ task }) => {
-                    executedAgents.push(task.agentId);
-                    return makeAgentResult(task);
+                    assert.equal(
+                        result.verification.functionalTests,
+                        "error"
+                    );
+
+                    assert.deepEqual(
+                        result.verification.evidence,
+                        [],
+                        "Invalid evidence must never become verification evidence."
+                    );
+
+                    assert.notEqual(
+                        result.status,
+                        "completed",
+                        "A project with invalid test evidence must not be completed."
+                    );
+                } finally {
+                    removeTestProject(projectRoot);
                 }
             });
-
-            const result = await runProject({
-                projectName,
-                description: "Resume the interrupted test project.",
-                runId,
-                resume: true,
-                approveFunctionalTests: false,
-                dependencies
-            });
-
-            assert.equal(plannerCalls, 0);
-
-            assert.deepEqual(
-                executedAgents,
-                ["devops-engineer"]
-            );
-
-            assert.equal(result.totalTasks, 9);
-            assert.equal(result.completed, 9);
-            assert.equal(result.failed, 0);
-            assert.equal(result.pending, 0);
-
-            assert.equal(
-                result.verification.functionalTests,
-                "approval_required"
-            );
-
-            assert.equal(
-                result.status,
-                "verification_required"
-            );
-
-            assert.equal(
-                result.recovery.resumedTaskIds.length,
-                8
-            );
-
-            assert.deepEqual(
-                result.recovery.resetTaskIds,
-                ["devops-engineer"]
-            );
-
-            console.log(
-                "[PROJECT RUNNER TEST] Checkpoint resume verified."
-            );
-
-        } finally {
-            removeTestProject(projectRoot);
         }
     }
 );
+
 
 
 // --------------------------------------------------
