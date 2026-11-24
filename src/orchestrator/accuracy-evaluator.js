@@ -149,17 +149,20 @@ function evaluateRuntime(verification) {
     };
 }
 
-function evaluateSecurity(qa) {
+function evaluateSecurity(qa, snapshotRunId) {
     const findings = qa?.report?.securityFindings;
 
     if (
-        qa?.status !== "passed" ||
+        !isObject(qa) ||
+        qa.status !== "passed" ||
+        !snapshotRunId ||
+        qa.snapshotRunId !== snapshotRunId ||
         !Array.isArray(findings)
     ) {
         return {
             measured: false,
             score: null,
-            reason: "Structured security findings are missing."
+            reason: "Structured security findings for the current snapshot are missing."
         };
     }
 
@@ -242,7 +245,7 @@ function evaluateAccuracy({
         integration: evaluateIntegration(integration, snapshotRunId),
         tests: evaluateTests(verification, snapshotRunId),
         runtime: evaluateRuntime(verification),
-        security: evaluateSecurity(qa),
+        security: evaluateSecurity(qa, snapshotRunId),
         export: evaluateExport(exportState, snapshotRunId)
     };
 
@@ -265,9 +268,11 @@ function evaluateAccuracy({
         ? Math.round(weightedScore)
         : null;
 
+    // Every evidence source must belong to the same snapshot.
     const sameSnapshot = Boolean(
         snapshotRunId &&
         integration?.snapshotRunId === snapshotRunId &&
+        qa?.snapshotRunId === snapshotRunId &&
         verification?.report?.snapshotRunId === snapshotRunId &&
         exportState?.snapshotRunId === snapshotRunId
     );

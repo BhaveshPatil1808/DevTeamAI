@@ -36,6 +36,7 @@ function completeEvidence() {
 
         qa: {
             status: "passed",
+            snapshotRunId,
             report: {
                 securityFindings: []
             }
@@ -153,7 +154,7 @@ test("inconsistent test counters remain unmeasured", () => {
     assert.equal(result.score, null);
 });
 
-test("different snapshot prevents perfect eligibility", () => {
+test("different export snapshot prevents perfect eligibility", () => {
     const evidence = completeEvidence();
 
     evidence.export.snapshotRunId = "another-snapshot";
@@ -180,6 +181,7 @@ test("security findings reduce security score", () => {
         snapshotRunId
     });
 
+    assert.equal(result.dimensions.security.measured, true);
     assert.equal(result.dimensions.security.score, 75);
 });
 
@@ -214,4 +216,77 @@ test("invalid export file evidence remains unmeasured", () => {
 
     assert.equal(result.dimensions.export.measured, false);
     assert.equal(result.score, null);
+});
+
+// QA snapshot consistency regression tests
+
+test("missing QA snapshot ID keeps security unmeasured", () => {
+    const evidence = completeEvidence();
+
+    delete evidence.qa.snapshotRunId;
+
+    const result = evaluateAccuracy({
+        ...evidence,
+        snapshotRunId
+    });
+
+    assert.equal(result.dimensions.security.measured, false);
+    assert.equal(result.dimensions.security.score, null);
+    assert.ok(result.unmeasured.includes("security"));
+    assert.equal(result.score, null);
+    assert.equal(result.sameSnapshot, false);
+    assert.equal(result.perfectScoreEligible, false);
+});
+
+test("mismatched QA snapshot ID keeps security unmeasured", () => {
+    const evidence = completeEvidence();
+
+    evidence.qa.snapshotRunId = "another-snapshot";
+
+    const result = evaluateAccuracy({
+        ...evidence,
+        snapshotRunId
+    });
+
+    assert.equal(result.dimensions.security.measured, false);
+    assert.equal(result.dimensions.security.score, null);
+    assert.ok(result.unmeasured.includes("security"));
+    assert.equal(result.score, null);
+    assert.equal(result.sameSnapshot, false);
+    assert.equal(result.perfectScoreEligible, false);
+});
+
+test("matching QA snapshot ID allows security measurement", () => {
+    const evidence = completeEvidence();
+
+    evidence.qa.snapshotRunId = snapshotRunId;
+    evidence.qa.report.securityFindings = [
+        { severity: "low" }
+    ];
+
+    const result = evaluateAccuracy({
+        ...evidence,
+        snapshotRunId
+    });
+
+    assert.equal(result.dimensions.security.measured, true);
+    assert.equal(result.dimensions.security.score, 99);
+    assert.equal(result.sameSnapshot, true);
+    assert.equal(result.status, "measured");
+});
+
+test("QA from another snapshot cannot produce a perfect score", () => {
+    const evidence = completeEvidence();
+
+    evidence.qa.snapshotRunId = "different-qa-snapshot";
+
+    const result = evaluateAccuracy({
+        ...evidence,
+        snapshotRunId
+    });
+
+    assert.equal(result.status, "incomplete");
+    assert.equal(result.score, null);
+    assert.equal(result.sameSnapshot, false);
+    assert.equal(result.perfectScoreEligible, false);
 });
