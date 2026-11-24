@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node src/ui/server.js",
     "legacy-cap-template": "node src/index.js",
-    "test": "node scripts/run-tests.js",
+    "test": "node --test src/orchestrator/*.test.js src/runtime/*.test.js",
     "test-ai": "node src/test-ollama.js"
   },
   "keywords": [],

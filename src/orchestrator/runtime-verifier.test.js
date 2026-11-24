@@ -1,3 +1,4 @@
+
 "use strict";
 
 const test = require("node:test");
@@ -26,7 +27,10 @@ const files = object => new Map(Object.entries(object));
 const manifest = (extra = {}) => JSON.stringify({
     name: "sample",
     version: "1.0.0",
-    scripts: { start: "node server.js" },
+    scripts: {
+        start: "node server.js",
+        test: "node --test"
+    },
     ...extra
 });
 
@@ -51,7 +55,6 @@ http.createServer((req, res) => {
     res.end("not found");
 }).listen(process.env.PORT || 3000, () => console.log("listening"));
 `;
-
 
 test("static check finds a missing required module", () => {
     const map = files({
@@ -116,13 +119,21 @@ test("static check finds missing local assets referenced by HTML", () => {
 });
 
 test("static check finds an invalid package.json and a missing start target", () => {
-    const broken = files({ "package.json": "{ nope", "server.js": "1" });
+    const broken = files({
+        "package.json": "{ nope",
+        "server.js": "1"
+    });
+
     const brokenIssues = analyzeStatic(broken, detectProject(broken));
 
     assert.equal(brokenIssues[0].kind, "invalid_json");
 
     const noEntry = files({
-        "package.json": manifest({ scripts: { start: "node src/main.js" } })
+        "package.json": manifest({
+            scripts: {
+                start: "node src/main.js"
+            }
+        })
     });
 
     const entryIssues = analyzeStatic(noEntry, detectProject(noEntry));
@@ -131,7 +142,11 @@ test("static check finds an invalid package.json and a missing start target", ()
 });
 
 test("startup errors are mapped to the file that must be fixed", () => {
-    const map = files({ "server.js": "1", "routes/a.js": "1" });
+    const map = files({
+        "server.js": "1",
+        "routes/a.js": "1"
+    });
+
     const workDir = os.tmpdir();
 
     const output = [
@@ -143,58 +158,75 @@ test("startup errors are mapped to the file that must be fixed", () => {
         `- ${workDir}/server.js`
     ].join("\n");
 
-    const issues = extractIssuesFromOutput(output, workDir, map, "server.js");
+    const issues = extractIssuesFromOutput(
+        output,
+        workDir,
+        map,
+        "server.js"
+    );
 
     assert.equal(issues[0].kind, "missing_file");
     assert.equal(issues[0].targetPath, "routes/models/student.js");
 });
 
-test("a working server passes and its assets are verified as served", { timeout: 60000 }, async () => {
-    const result = await verifyRuntime({
-        files: files({
-            "package.json": manifest(),
-            "server.js": WORKING_SERVER,
-            "public/index.html": '<script src="/app.js"></script>',
-            "public/app.js": "console.log('hi');"
-        }),
-        startWaitMs: 10000
-    });
-
-    assert.equal(result.status, "passed", result.summary);
-    assert.ok(result.url);
-});
-
-test("a crash on startup fails and points at the crashing file", { timeout: 60000 }, async () => {
-    const result = await verifyRuntime({
-        files: files({
-            "package.json": manifest(),
-            "server.js": "function start() { notDefinedAnywhere(); }\nstart();\n"
-        }),
-        startWaitMs: 10000
-    });
-
-    assert.equal(result.status, "failed");
-    assert.equal(result.issues[0].targetPath, "server.js");
-});
-
-test("provider API keys are never exposed to generated code", { timeout: 60000 }, async () => {
-    process.env.TEST_PROVIDER_API_KEY = "must-not-leak";
-
-    try {
+test(
+    "a working server passes and its assets are verified as served",
+    { timeout: 60000 },
+    async () => {
         const result = await verifyRuntime({
             files: files({
                 "package.json": manifest(),
-                "server.js":
-                    "if (process.env.TEST_PROVIDER_API_KEY) process.exit(2);"
+                "server.js": WORKING_SERVER,
+                "public/index.html": '<script src="/app.js"></script>',
+                "public/app.js": "console.log('hi');"
             }),
             startWaitMs: 10000
         });
 
         assert.equal(result.status, "passed", result.summary);
-    } finally {
-        delete process.env.TEST_PROVIDER_API_KEY;
+        assert.ok(result.url);
     }
-});
+);
+
+test(
+    "a crash on startup fails and points at the crashing file",
+    { timeout: 60000 },
+    async () => {
+        const result = await verifyRuntime({
+            files: files({
+                "package.json": manifest(),
+                "server.js": "function start() { notDefinedAnywhere(); }\nstart();\n"
+            }),
+            startWaitMs: 10000
+        });
+
+        assert.equal(result.status, "failed");
+        assert.equal(result.issues[0].targetPath, "server.js");
+    }
+);
+
+test(
+    "provider API keys are never exposed to generated code",
+    { timeout: 60000 },
+    async () => {
+        process.env.TEST_PROVIDER_API_KEY = "must-not-leak";
+
+        try {
+            const result = await verifyRuntime({
+                files: files({
+                    "package.json": manifest(),
+                    "server.js":
+                        "if (process.env.TEST_PROVIDER_API_KEY) process.exit(2);"
+                }),
+                startWaitMs: 10000
+            });
+
+            assert.equal(result.status, "passed", result.summary);
+        } finally {
+            delete process.env.TEST_PROVIDER_API_KEY;
+        }
+    }
+);
 
 test(
     "full loop: verify -> repair missing files with injected agents -> verify again -> export",
@@ -208,31 +240,54 @@ test(
             const runId = randomUUID();
             const firstSnapshotId = randomUUID();
 
+            // Initial snapshot intentionally has a missing application module.
+            // The native test suite is present from the beginning.
             const initial = [
-                { path: "package.json", content: manifest() },
+                {
+                    path: "package.json",
+                    content: manifest()
+                },
                 {
                     path: "server.js",
                     content: `
 const http = require("http");
 const greeting = require("./lib/greeting");
+
 http.createServer((req, res) => res.end(greeting()))
     .listen(process.env.PORT || 3000, () => console.log("up"));
+`
+                },
+                {
+                    path: "test/app.test.js",
+                    content: `
+const test = require("node:test");
+const assert = require("node:assert/strict");
+const greeting = require("../lib/greeting");
+
+test("generated greeting module returns the expected response", () => {
+    assert.equal(greeting(), "hello");
+});
 `
                 }
             ];
 
             let snapshotFiles = writeIntegratedFiles(
-                projectRoot, initial, runId, firstSnapshotId
+                projectRoot,
+                initial,
+                runId,
+                firstSnapshotId
             );
 
-            let snapshotId = firstSnapshotId;
+            const snapshotId = firstSnapshotId;
 
+            // Static QA on the initial snapshot.
             const qaReport = await runStaticQA({
                 projectRoot,
                 runId: snapshotId,
                 integrationFiles: snapshotFiles
             });
 
+            // First verification must fail because lib/greeting.js is missing.
             const first = await runApprovedFunctionalTests({
                 projectRoot,
                 runId,
@@ -240,7 +295,9 @@ http.createServer((req, res) => res.end(greeting()))
                 integrationFiles: snapshotFiles,
                 approved: true,
                 runtimeVerification: true,
-                runtimeOptions: { startWaitMs: 10000 }
+                runtimeOptions: {
+                    startWaitMs: 10000
+                }
             });
 
             assert.equal(first.status, "failed");
@@ -250,13 +307,17 @@ http.createServer((req, res) => res.end(greeting()))
                 ["lib/greeting.js"]
             );
 
+            // Run automated repair with an injected mock backend agent.
             const requested = [];
 
             const repaired = await runAutomatedRepair({
                 projectRoot,
                 projectName: "Greeter",
                 description: "A tiny greeting server.",
-                plan: { summary: "", technologyStack: ["Node.js"] },
+                plan: {
+                    summary: "",
+                    technologyStack: ["Node.js"]
+                },
                 runId,
                 snapshotRunId: snapshotId,
                 integrationFiles: snapshotFiles,
@@ -264,26 +325,45 @@ http.createServer((req, res) => res.end(greeting()))
                 functionalResult: first,
                 dependencies: {
                     executePlannedTask: async ({ task, projectContext }) => {
-                        requested.push({ task, projectContext });
+                        requested.push({
+                            task,
+                            projectContext
+                        });
 
                         return {
                             agentName: "Mock Backend",
-                            summary: "created",
-                            files: [{
-                                path: "lib/greeting.js",
-                                content:
-                                    'module.exports = () => "hello";\n'
-                            }]
+                            summary: "Created missing greeting module.",
+                            files: [
+                                {
+                                    path: "lib/greeting.js",
+                                    content:
+                                        'module.exports = () => "hello";\n'
+                                }
+                            ]
                         };
                     }
                 }
             });
 
             assert.equal(requested.length, 1);
-            assert.match(requested[0].projectContext, /server\.js/);
-            assert.match(requested[0].projectContext, /Missing file|lib\/greeting\.js/);
-            assert.notEqual(repaired.snapshotRunId, snapshotId);
 
+            assert.match(
+                requested[0].projectContext,
+                /server\.js/
+            );
+
+            assert.match(
+                requested[0].projectContext,
+                /Missing file|lib\/greeting\.js/
+            );
+
+            // Repair must create a new immutable snapshot.
+            assert.notEqual(
+                repaired.snapshotRunId,
+                snapshotId
+            );
+
+            // Re-run native tests and runtime verification on the repaired snapshot.
             const second = await runApprovedFunctionalTests({
                 projectRoot,
                 runId,
@@ -291,11 +371,18 @@ http.createServer((req, res) => res.end(greeting()))
                 integrationFiles: repaired.integrationFiles,
                 approved: true,
                 runtimeVerification: true,
-                runtimeOptions: { startWaitMs: 10000 }
+                runtimeOptions: {
+                    startWaitMs: 10000
+                }
             });
 
-            assert.equal(second.status, "passed", JSON.stringify(second.runtime));
+            assert.equal(
+                second.status,
+                "passed",
+                JSON.stringify(second, null, 2)
+            );
 
+            // Export only the successfully verified repaired snapshot.
             const exported = exportIntegratedProject({
                 projectRoot,
                 snapshotRunId: repaired.snapshotRunId,
@@ -304,18 +391,42 @@ http.createServer((req, res) => res.end(greeting()))
 
             assert.deepEqual(
                 exported.files.sort(),
-                ["lib/greeting.js", "package.json", "server.js"]
+                [
+                    "lib/greeting.js",
+                    "package.json",
+                    "server.js",
+                    "test/app.test.js"
+                ]
             );
 
             assert.ok(
-                fs.existsSync(path.join(projectRoot, "final", "server.js"))
+                fs.existsSync(
+                    path.join(projectRoot, "final", "server.js")
+                )
             );
 
             assert.ok(
-                !fs.existsSync(path.join(projectRoot, "final", ".devteam"))
+                fs.existsSync(
+                    path.join(projectRoot, "final", "test", "app.test.js")
+                )
+            );
+
+            assert.ok(
+                fs.existsSync(
+                    path.join(projectRoot, "final", "lib", "greeting.js")
+                )
+            );
+
+            assert.ok(
+                !fs.existsSync(
+                    path.join(projectRoot, "final", ".devteam")
+                )
             );
         } finally {
-            fs.rmSync(projectRoot, { recursive: true, force: true });
+            fs.rmSync(projectRoot, {
+                recursive: true,
+                force: true
+            });
         }
     }
 );

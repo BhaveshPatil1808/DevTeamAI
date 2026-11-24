@@ -126,6 +126,7 @@ function makePassedQA() {
     };
 }
 
+
 function makeDependencies(overrides = {}) {
     return {
         createProjectPlan: async () => makePlan(),
@@ -143,22 +144,57 @@ function makeDependencies(overrides = {}) {
             throw new Error("Unexpected repair call in this test.");
         },
 
-        runApprovedFunctionalTests: async ({
+        runApprovedFunctionalTests: async () => {
+            throw new Error(
+                "Functional tests were not configured for this test."
+            );
+        },
+
+        exportIntegratedProject: async ({
+            projectRoot,
             snapshotRunId,
-            approved
-        }) => ({
-            status: approved ? "passed" : "approval_required",
-            snapshotRunId,
-            report: {
-                summary: approved
-                    ? "Mock functional tests passed."
-                    : "Functional-test approval is required."
+            integrationFiles
+        }) => {
+            const finalDirectory = path.join(
+                projectRoot,
+                "final"
+            );
+
+            fs.rmSync(finalDirectory, {
+                recursive: true,
+                force: true
+            });
+
+            for (const file of integrationFiles) {
+                const relativePath = file.path;
+                const absolutePath = path.join(
+                    finalDirectory,
+                    relativePath
+                );
+
+                fs.mkdirSync(path.dirname(absolutePath), {
+                    recursive: true
+                });
+
+                fs.writeFileSync(
+                    absolutePath,
+                    "// Test export file\n",
+                    "utf8"
+                );
             }
-        }),
+
+            return {
+                directory: "final",
+                fileCount: integrationFiles.length,
+                files: integrationFiles.map(file => file.path),
+                snapshotRunId
+            };
+        },
 
         ...overrides
     };
 }
+
 
 function removeTestProject(projectRoot) {
     if (!projectRoot) return;
@@ -232,7 +268,8 @@ function makeInitialState(projectName, runId) {
             functionalTests: "not_run",
             report: null,
             evidence: []
-        }
+        },
+        export: { status: "not_attempted", path: null, fileCount: 0, snapshotRunId: null }
     };
 }
 
@@ -241,11 +278,13 @@ function makeInitialState(projectName, runId) {
 // TEST 1: FUNCTIONAL FAILURE -> REPAIR -> RETEST
 // --------------------------------------------------
 
+
 test(
     "Project Runner repairs a functional failure using a new snapshot",
     async () => {
         const projectName = makeProjectName("repair");
         const runId = randomUUID();
+
         const projectRoot = getProjectRoot(
             projectName.toLowerCase().replace(/[^a-z0-9]+/g, "-")
         );
@@ -265,31 +304,57 @@ test(
                 approved
             }) => {
                 assert.equal(approved, true);
+
                 functionalCalls++;
 
+                // FIRST EXECUTION: deliberately fail.
                 if (functionalCalls === 1) {
                     return {
                         status: "failed",
+                        approval: "granted",
                         snapshotRunId,
                         error: "Intentional test failure.",
+
                         report: {
-                            summary: "One test failed."
-                        },
-                        results: [{
-                            status: "failed",
-                            command: "node --test",
-                            exitCode: 1,
-                            stdout: "Assertion failed",
-                            stderr: ""
-                        }]
+                            summary: "One test failed.",
+                            testsExecuted: 1,
+                            testsPassed: 0,
+                            testsFailed: 1,
+
+                            results: [{
+                                status: "failed",
+                                command: "node --test",
+                                exitCode: 1,
+                                stdout: "Assertion failed",
+                                stderr: ""
+                            }]
+                        }
                     };
                 }
 
+                // SECOND EXECUTION: pass after repair.
                 return {
                     status: "passed",
+                    approval: "granted",
                     snapshotRunId,
+
+                    runtime: {
+                        status: "passed"
+                    },
+
                     report: {
-                        summary: "Tests passed after repair."
+                        summary: "Tests passed after repair.",
+                        testsExecuted: 1,
+                        testsPassed: 1,
+                        testsFailed: 0,
+
+                        results: [{
+                            status: "passed",
+                            command: "node --test",
+                            exitCode: 0,
+                            stdout: "Tests passed",
+                            stderr: ""
+                        }]
                     }
                 };
             },
@@ -308,15 +373,19 @@ test(
 
                 return {
                     status: "completed",
+
                     attempts: [{
                         attempt: 1,
                         status: "completed"
                     }],
+
                     snapshotRunId: newSnapshotId,
+
                     integrationFiles: [{
                         path: "src/index.js",
                         bytes: 20
                     }],
+
                     qaReport: makePassedQA()
                 };
             }
@@ -331,31 +400,46 @@ test(
                 dependencies
             });
 
+            // Agent execution.
             assert.equal(executedAgents, 9);
             assert.equal(result.completed, 9);
             assert.equal(result.failed, 0);
 
+            // Repair and retesting.
             assert.equal(repairCalls, 1);
             assert.equal(functionalCalls, 2);
 
+            // Final QA.
             assert.equal(result.qaStatus, "passed");
+
+            // Functional verification.
             assert.equal(
                 result.verification.functionalTests,
                 "passed"
             );
-            assert.equal(result.verification.status, "verified");
+
+            assert.equal(
+                result.verification.status,
+                "verified"
+            );
+
+            // Project completion.
             assert.equal(result.status, "completed");
 
+            // Repair-cycle evidence.
             assert.equal(
                 result.verification.repairCycles.length,
                 1
             );
 
-            const cycle = result.verification.repairCycles[0];
+            const cycle =
+                result.verification.repairCycles[0];
 
             assert.equal(cycle.status, "verified");
+
             assert.ok(cycle.previousSnapshotId);
             assert.ok(cycle.newSnapshotId);
+
             assert.notEqual(
                 cycle.previousSnapshotId,
                 cycle.newSnapshotId
@@ -370,6 +454,7 @@ test(
         }
     }
 );
+
 
 
 // --------------------------------------------------

@@ -1,25 +1,19 @@
+
 "use strict";
 
 /**
- * Runtime verifier.
+ * DevTeamAI Runtime Verifier
  *
- * Answers one question about a generated project: "does it actually run?"
+ * Verification stages:
+ * 1. Static completeness checks.
+ * 2. Dependency installation, when required.
+ * 3. Restricted application startup.
+ * 4. HTTP response and referenced asset verification.
  *
- *   1. Static completeness check (no network, no execution):
- *        - every relative require()/import resolves to a real file
- *        - every local <script>/<link>/<img> in HTML exists
- *        - package.json is valid, `main` / `start` targets exist
- *        - every bare import is declared as a dependency
- *   2. npm install (only when the project declares dependencies)
- *   3. Start the app, wait for it to listen / stay alive, probe it over HTTP
- *      and make sure the assets its home page references are really served.
- *
- * Every failure is converted into structured "issues" that point at the
- * file that must be created or fixed ({ kind, targetPath, message }). The
- * repair engine uses those to drive the agents until the project runs.
- *
- * The generated code is executed in a throw-away temp directory with
- * secrets (API keys, tokens ...) removed from the environment.
+ * Important security limitation:
+ * Network isolation and process limits are used where supported.
+ * Filesystem isolation is NOT provided by the current BAS environment.
+ * This is not a secure sandbox for untrusted code.
  */
 
 const fs = require("node:fs");
@@ -30,6 +24,11 @@ const path = require("node:path");
 const { spawn, spawnSync } = require("node:child_process");
 const { randomUUID } = require("node:crypto");
 const { builtinModules } = require("node:module");
+
+const {
+    buildRestrictedInvocation,
+    buildRestrictedEnv
+} = require("./restricted-execution");
 
 const IS_WINDOWS = process.platform === "win32";
 
@@ -85,9 +84,9 @@ const ENTRY_CANDIDATES = [
 ];
 
 
-// --------------------------------------------------
+// ==================================================
 // SMALL HELPERS
-// --------------------------------------------------
+// ==================================================
 
 function toPosix(value) {
     return String(value).replace(/\\/g, "/");
@@ -128,7 +127,12 @@ function dirnameOf(relativePath) {
 }
 
 function makeIssue(kind, targetPath, message, extra = {}) {
-    return { kind, targetPath, message, ...extra };
+    return {
+        kind,
+        targetPath,
+        message,
+        ...extra
+    };
 }
 
 function dedupeIssues(issues) {
@@ -139,6 +143,7 @@ function dedupeIssues(issues) {
         if (!issue || !issue.targetPath) continue;
 
         const key = `${issue.kind}:${issue.targetPath}`;
+
         if (seen.has(key)) continue;
 
         seen.add(key);
@@ -150,28 +155,16 @@ function dedupeIssues(issues) {
     return result;
 }
 
-function buildRuntimeEnv(extra = {}) {
-    const env = {};
-
-    for (const [key, value] of Object.entries(process.env)) {
-        // Never expose provider keys or other secrets to generated code.
-        if (/(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|PASSPHRASE)/i.test(key)) {
-            continue;
-        }
-
-        if (/^npm_config_offline$/i.test(key)) continue;
-
-        env[key] = value;
-    }
-
-    env.NODE_ENV = "development";
-    env.BROWSER = "none";
-    env.CI = "true";
-    env.NO_COLOR = "1";
-    env.FORCE_COLOR = "0";
-    env.npm_config_update_notifier = "false";
-
-    return { ...env, ...extra };
+function buildRuntimeEnv(extra = {}, cwd = os.tmpdir()) {
+    return buildRestrictedEnv(cwd, {
+        NODE_ENV: "development",
+        BROWSER: "none",
+        CI: "true",
+        NO_COLOR: "1",
+        FORCE_COLOR: "0",
+        npm_config_update_notifier: "false",
+        ...extra
+    });
 }
 
 function findFreePort() {
@@ -179,17 +172,22 @@ function findFreePort() {
         const server = net.createServer();
 
         server.unref();
+
         server.on("error", () => resolve(0));
 
         server.listen(0, "127.0.0.1", () => {
-            const { port } = server.address();
+            const address = server.address();
+            const port = address?.port || 0;
+
             server.close(() => resolve(port));
         });
     });
 }
 
 function killTree(child) {
-    if (!child || child.exitCode !== null || !child.pid) return;
+    if (!child || child.exitCode !== null || !child.pid) {
+        return;
+    }
 
     try {
         if (IS_WINDOWS) {
@@ -215,13 +213,20 @@ function sleep(ms) {
 }
 
 
-// --------------------------------------------------
+// ==================================================
 // PROJECT DETECTION
-// --------------------------------------------------
+// ==================================================
 
 function readJson(files, name) {
     const entry = files.get(name);
-    if (!entry) return { exists: false, value: null, error: null };
+
+    if (!entry) {
+        return {
+            exists: false,
+            value: null,
+            error: null
+        };
+    }
 
     try {
         return {
@@ -230,39 +235,87 @@ function readJson(files, name) {
             error: null
         };
     } catch (error) {
-        return { exists: true, value: null, error: error.message };
+        return {
+            exists: true,
+            value: null,
+            error: error.message
+        };
     }
 }
 
 function detectProject(files) {
     const pkg = readJson(files, "package.json");
 
-    if (pkg.exists) return { type: "node", pkg };
+    if (pkg.exists) {
+        return {
+            type: "node",
+            pkg
+        };
+    }
 
     const hasPython =
         files.has("requirements.txt") ||
         files.has("pyproject.toml") ||
         [...files.keys()].some(name => name.endsWith(".py"));
 
-    if (hasPython) return { type: "python", pkg };
+    if (hasPython) {
+        return {
+            type: "python",
+            pkg
+        };
+    }
 
-    const hasHtml = [...files.keys()].some(name => /\.html?$/i.test(name));
-
-    if (hasHtml) return { type: "static", pkg };
-
-    const hasLooseNode = [...files.keys()].some(
-        name => /\.(js|mjs|cjs)$/i.test(name)
+    const hasHtml = [...files.keys()].some(name =>
+        /\.html?$/i.test(name)
     );
 
-    if (hasLooseNode) return { type: "node", pkg };
+    if (hasHtml) {
+        return {
+            type: "static",
+            pkg
+        };
+    }
 
-    return { type: "unknown", pkg };
+    const hasLooseNode = [...files.keys()].some(name =>
+        /\.(js|mjs|cjs)$/i.test(name)
+    );
+
+    if (hasLooseNode) {
+        return {
+            type: "node",
+            pkg
+        };
+    }
+
+    return {
+        type: "unknown",
+        pkg
+    };
+}
+
+function guessScriptEntry(script, files) {
+    const match = String(script).match(
+        /(?:^|\s)(?:node|nodemon|ts-node|tsx)\s+(?:--?[\w-]+(?:=\S+)?\s+)*([^\s&|;]+\.(?:c|m)?[jt]s)/
+    );
+
+    if (match) {
+        const normalized = normalizeRelative(match[1]);
+
+        if (normalized) return normalized;
+    }
+
+    return ENTRY_CANDIDATES.find(candidate =>
+        files.has(candidate)
+    ) || null;
 }
 
 function pickNodeStart(files, pkg) {
     const scripts = pkg?.value?.scripts || {};
 
-    if (typeof scripts.start === "string" && scripts.start.trim()) {
+    if (
+        typeof scripts.start === "string" &&
+        scripts.start.trim()
+    ) {
         return {
             command: "npm",
             args: ["start"],
@@ -300,23 +353,10 @@ function pickNodeStart(files, pkg) {
     return null;
 }
 
-function guessScriptEntry(script, files) {
-    const match = String(script).match(
-        /(?:^|\s)(?:node|nodemon|ts-node|tsx)\s+(?:--?[\w-]+(?:=\S+)?\s+)*([^\s&|;]+\.(?:c|m)?[jt]s)/
-    );
 
-    if (match) {
-        const normalized = normalizeRelative(match[1]);
-        if (normalized) return normalized;
-    }
-
-    return ENTRY_CANDIDATES.find(candidate => files.has(candidate)) || null;
-}
-
-
-// --------------------------------------------------
+// ==================================================
 // STATIC COMPLETENESS CHECK
-// --------------------------------------------------
+// ==================================================
 
 function stripJsComments(source) {
     return String(source)
@@ -347,7 +387,12 @@ function extractModuleSpecifiers(source) {
 function resolveModuleFile(files, baseDir, spec) {
     const base = joinRelative(baseDir, spec);
 
-    if (!base) return { found: null, wanted: null };
+    if (!base) {
+        return {
+            found: null,
+            wanted: null
+        };
+    }
 
     const candidates = [
         base,
@@ -362,9 +407,12 @@ function resolveModuleFile(files, baseDir, spec) {
         `${base}/index.ts`
     ];
 
-    const found = candidates.find(candidate => files.has(candidate));
+    const found = candidates.find(candidate =>
+        files.has(candidate)
+    );
 
-    const hasExtension = /\.[a-z0-9]+$/i.test(path.posix.basename(base));
+    const hasExtension =
+        /\.[a-z0-9]+$/i.test(path.posix.basename(base));
 
     return {
         found: found || null,
@@ -384,7 +432,10 @@ function nearestDependencies(files, fromFile) {
     let dir = dirnameOf(fromFile);
 
     for (;;) {
-        const manifestPath = dir ? `${dir}/package.json` : "package.json";
+        const manifestPath = dir
+            ? `${dir}/package.json`
+            : "package.json";
+
         const manifest = readJson(files, manifestPath);
 
         if (manifest.value) {
@@ -402,16 +453,20 @@ function nearestDependencies(files, fromFile) {
         }
 
         if (!dir) break;
+
         dir = dirnameOf(dir);
     }
 
-    return { manifestPath: "package.json", names: null };
+    return {
+        manifestPath: "package.json",
+        names: null
+    };
 }
 
 function isLocalReference(ref) {
     const value = String(ref || "").trim();
 
-    return (
+    return Boolean(
         value &&
         !value.startsWith("#") &&
         !value.startsWith("//") &&
@@ -422,10 +477,25 @@ function isLocalReference(ref) {
     );
 }
 
-function resolveHtmlReference(files, htmlPath, ref) {
-    const clean = decodeUriSafe(String(ref).split(/[?#]/)[0]);
+function decodeUriSafe(value) {
+    try {
+        return decodeURIComponent(value);
+    } catch {
+        return value;
+    }
+}
 
-    if (!clean) return { found: true, wanted: null };
+function resolveHtmlReference(files, htmlPath, ref) {
+    const clean = decodeUriSafe(
+        String(ref).split(/[?#]/)[0]
+    );
+
+    if (!clean) {
+        return {
+            found: true,
+            wanted: null
+        };
+    }
 
     const htmlDir = dirnameOf(htmlPath);
 
@@ -437,14 +507,19 @@ function resolveHtmlReference(files, htmlPath, ref) {
 
         for (const root of roots) {
             const candidate = joinRelative(root, rootRelative);
+
             if (candidate && files.has(candidate)) {
-                return { found: true, wanted: candidate };
+                return {
+                    found: true,
+                    wanted: candidate
+                };
             }
         }
 
-        const wanted = joinRelative(htmlDir, rootRelative);
-
-        return { found: false, wanted };
+        return {
+            found: false,
+            wanted: joinRelative(htmlDir, rootRelative)
+        };
     }
 
     const candidate = joinRelative(htmlDir, clean);
@@ -453,14 +528,6 @@ function resolveHtmlReference(files, htmlPath, ref) {
         found: Boolean(candidate && files.has(candidate)),
         wanted: candidate
     };
-}
-
-function decodeUriSafe(value) {
-    try {
-        return decodeURIComponent(value);
-    } catch {
-        return value;
-    }
 }
 
 function extractHtmlReferences(html) {
@@ -474,13 +541,21 @@ function extractHtmlReferences(html) {
         const attribute = element === "link" ? "href" : "src";
 
         const match = tag[0].match(
-            new RegExp(`\\b${attribute}\\s*=\\s*(?:"([^"]*)"|'([^']*)')`, "i")
+            new RegExp(
+                `\\b${attribute}\\s*=\\s*(?:"([^"]*)"|'([^']*)')`,
+                "i"
+            )
         );
 
-        const value = match ? (match[1] ?? match[2]) : null;
+        const value = match
+            ? (match[1] ?? match[2])
+            : null;
 
         if (isLocalReference(value)) {
-            refs.push({ element, ref: value });
+            refs.push({
+                element,
+                ref: value
+            });
         }
     }
 
@@ -489,16 +564,14 @@ function extractHtmlReferences(html) {
 
 function analyzeStatic(files, project) {
     const issues = [];
-
-    // ---- package.json ------------------------------------------------
     const pkg = project.pkg;
 
+    // package.json
     if (pkg?.exists && pkg.error) {
         issues.push(makeIssue(
             "invalid_json",
             "package.json",
-            `package.json is not valid JSON (${pkg.error}). ` +
-            `Return a complete, valid package.json.`
+            `package.json is not valid JSON (${pkg.error}). Return a complete, valid package.json.`
         ));
     }
 
@@ -508,12 +581,15 @@ function analyzeStatic(files, project) {
         if (typeof value.main === "string") {
             const main = normalizeRelative(value.main);
 
-            if (main && !files.has(main) && !files.has(`${main}.js`)) {
+            if (
+                main &&
+                !files.has(main) &&
+                !files.has(`${main}.js`)
+            ) {
                 issues.push(makeIssue(
                     "missing_file",
                     main,
-                    `package.json "main" points to ${main}, which does not exist. ` +
-                    `Create ${main} as the working entry point of the application.`,
+                    `package.json "main" points to ${main}, which does not exist. Create ${main}.`,
                     { requiredBy: "package.json" }
                 ));
             }
@@ -522,7 +598,6 @@ function analyzeStatic(files, project) {
         const startScript = value.scripts?.start;
 
         if (typeof startScript === "string") {
-            const entry = guessScriptEntry(startScript, files);
             const direct = startScript.match(
                 /(?:^|\s)(?:node|nodemon)\s+(?:--?[\w-]+(?:=\S+)?\s+)*([^\s&|;]+\.(?:c|m)?js)/
             );
@@ -534,32 +609,34 @@ function analyzeStatic(files, project) {
                     issues.push(makeIssue(
                         "missing_file",
                         wanted,
-                        `The "start" script runs ${wanted}, which does not exist. ` +
-                        `Create ${wanted} as the working entry point of the application.`,
+                        `The start script runs ${wanted}, but that file does not exist.`,
                         { requiredBy: "package.json" }
                     ));
                 }
             }
-
-            void entry;
-        } else if (!value.main && !pickNodeStart(files, pkg)) {
+        } else if (
+            !value.main &&
+            !pickNodeStart(files, pkg)
+        ) {
             issues.push(makeIssue(
                 "no_start",
                 "package.json",
-                `package.json has no "start" script, no "main" and no ` +
-                `recognizable entry file. Add a "start" script that launches ` +
-                `the application (for example "node server.js") and make sure ` +
-                `the entry file exists.`
+                'package.json has no "start" script, no "main", and no recognizable entry file.'
             ));
         }
     }
 
-    // ---- JavaScript modules -----------------------------------------
+    // JavaScript imports
     for (const [filePath, content] of files) {
-        if (!/\.(js|mjs|cjs)$/i.test(filePath)) continue;
+        if (!/\.(js|mjs|cjs)$/i.test(filePath)) {
+            continue;
+        }
 
         const baseDir = dirnameOf(filePath);
-        const dependencyInfo = nearestDependencies(files, filePath);
+        const dependencyInfo = nearestDependencies(
+            files,
+            filePath
+        );
 
         for (const spec of extractModuleSpecifiers(content)) {
             if (spec.startsWith(".")) {
@@ -573,9 +650,7 @@ function analyzeStatic(files, project) {
                     issues.push(makeIssue(
                         "missing_file",
                         wanted,
-                        `${filePath} imports "${spec}" but ${wanted} does not ` +
-                        `exist. Create ${wanted} with a complete working ` +
-                        `implementation that matches how ${filePath} uses it.`,
+                        `${filePath} imports "${spec}", but ${wanted} does not exist.`,
                         { requiredBy: filePath }
                     ));
                 }
@@ -595,8 +670,9 @@ function analyzeStatic(files, project) {
 
             if (!name || BUILTINS.has(name)) continue;
 
-            // Browser files may legitimately use bare specifiers via import maps.
-            if (/(^|\/)(public|static|client|www)\//.test(filePath)) continue;
+            if (/(^|\/)(public|static|client|www)\//.test(filePath)) {
+                continue;
+            }
 
             if (
                 dependencyInfo.names &&
@@ -605,32 +681,41 @@ function analyzeStatic(files, project) {
                 issues.push(makeIssue(
                     "missing_dependency",
                     dependencyInfo.manifestPath,
-                    `${filePath} requires the package "${name}" but it is not ` +
-                    `listed in ${dependencyInfo.manifestPath}. Add "${name}" to ` +
-                    `"dependencies" with a real, published version range ` +
-                    `and return the complete package.json.`,
-                    { requiredBy: filePath, packageName: name }
+                    `${filePath} requires "${name}", but it is not declared in ${dependencyInfo.manifestPath}.`,
+                    {
+                        requiredBy: filePath,
+                        packageName: name
+                    }
                 ));
-            } else if (!dependencyInfo.names && project.type === "node") {
+            } else if (
+                !dependencyInfo.names &&
+                project.type === "node"
+            ) {
                 issues.push(makeIssue(
                     "missing_dependency",
                     "package.json",
-                    `${filePath} requires the package "${name}" but the project ` +
-                    `has no package.json. Create a complete package.json that ` +
-                    `declares "${name}" and a "start" script.`,
-                    { requiredBy: filePath, packageName: name }
+                    `${filePath} requires "${name}", but package.json is missing.`,
+                    {
+                        requiredBy: filePath,
+                        packageName: name
+                    }
                 ));
             }
         }
     }
 
-    // ---- Other JSON files -------------------------------------------
+    // Other JSON files
     for (const [filePath, content] of files) {
-        if (!/\.json$/i.test(filePath) || filePath === "package.json") {
+        if (
+            !/\.json$/i.test(filePath) ||
+            filePath === "package.json"
+        ) {
             continue;
         }
 
-        if (/(^|\/)(tsconfig|jsconfig)[^/]*\.json$/i.test(filePath)) continue;
+        if (/(^|\/)(tsconfig|jsconfig)[^/]*\.json$/i.test(filePath)) {
+            continue;
+        }
 
         try {
             JSON.parse(content);
@@ -638,13 +723,12 @@ function analyzeStatic(files, project) {
             issues.push(makeIssue(
                 "invalid_json",
                 filePath,
-                `${filePath} is not valid JSON (${error.message}). ` +
-                `Return the complete, valid file.`
+                `${filePath} is not valid JSON (${error.message}).`
             ));
         }
     }
 
-    // ---- HTML references --------------------------------------------
+    // HTML references
     for (const [filePath, content] of files) {
         if (!/\.html?$/i.test(filePath)) continue;
 
@@ -660,9 +744,7 @@ function analyzeStatic(files, project) {
             issues.push(makeIssue(
                 "missing_file",
                 wanted,
-                `${filePath} references ${ref} (<${element}>) but ${wanted} ` +
-                `does not exist. Create ${wanted} with a complete working ` +
-                `implementation that matches how ${filePath} uses it.`,
+                `${filePath} references ${ref} (<${element}>), but ${wanted} does not exist.`,
                 { requiredBy: filePath }
             ));
         }
@@ -672,9 +754,9 @@ function analyzeStatic(files, project) {
 }
 
 
-// --------------------------------------------------
+// ==================================================
 // PROCESS EXECUTION
-// --------------------------------------------------
+// ==================================================
 
 function spawnOptions(cwd, env, detached) {
     return {
@@ -683,24 +765,32 @@ function spawnOptions(cwd, env, detached) {
         detached,
         windowsHide: true,
         stdio: ["ignore", "pipe", "pipe"],
-        // npm is a .cmd shim on Windows. Arguments here are fixed, never
-        // user supplied, so using a shell is safe for that platform only.
         shell: IS_WINDOWS
     };
 }
 
-function runProcess({ command, args, cwd, env, timeoutMs }) {
+function runProcess({
+    command,
+    args,
+    cwd,
+    env,
+    timeoutMs,
+    networkIsolation = false
+}) {
     return new Promise(resolve => {
         let stdout = "";
         let stderr = "";
         let timedOut = false;
         let settled = false;
         let child;
+        let timer;
 
         function finish(result) {
             if (settled) return;
+
             settled = true;
-            clearTimeout(timer);
+
+            if (timer) clearTimeout(timer);
 
             resolve({
                 stdout: tail(stdout),
@@ -711,9 +801,18 @@ function runProcess({ command, args, cwd, env, timeoutMs }) {
         }
 
         try {
-            child = spawn(
+            const invocation = buildRestrictedInvocation(
                 command,
                 args,
+                {
+                    networkIsolation,
+                    cpuSeconds: Math.ceil(timeoutMs / 1000) + 30
+                }
+            );
+
+            child = spawn(
+                invocation.command,
+                invocation.args,
                 spawnOptions(cwd, env, !IS_WINDOWS)
             );
         } catch (error) {
@@ -722,33 +821,60 @@ function runProcess({ command, args, cwd, env, timeoutMs }) {
                 stdout: "",
                 stderr: "",
                 timedOut: false,
-                spawnError: error.message
+                spawnError: error.message,
+                outcome:
+                    error.code === "RESTRICTED_EXECUTION_UNAVAILABLE"
+                        ? "unsupported"
+                        : "spawn_error"
             });
+
             return;
         }
 
-        const timer = setTimeout(() => {
+        timer = setTimeout(() => {
             timedOut = true;
             killTree(child);
         }, timeoutMs);
 
         child.stdout.on("data", chunk => {
-            stdout = tail(stdout + chunk.toString("utf8"), 200000);
+            stdout = tail(
+                stdout + chunk.toString("utf8"),
+                200000
+            );
         });
 
         child.stderr.on("data", chunk => {
-            stderr = tail(stderr + chunk.toString("utf8"), 200000);
+            stderr = tail(
+                stderr + chunk.toString("utf8"),
+                200000
+            );
         });
 
         child.on("error", error => {
-            finish({ code: null, spawnError: error.message });
+            finish({
+                code: null,
+                spawnError: error.message,
+                outcome:
+                    error.code === "RESTRICTED_EXECUTION_UNAVAILABLE"
+                        ? "unsupported"
+                        : "spawn_error"
+            });
         });
 
         child.on("close", (code, signal) => {
-            finish({ code, signal });
+            finish({
+                code,
+                signal,
+                outcome: "exited"
+            });
         });
     });
 }
+
+
+// ==================================================
+// HTTP PROBES
+// ==================================================
 
 function httpProbe(port, urlPath = "/", timeoutMs = 2500) {
     return new Promise(resolve => {
@@ -759,7 +885,9 @@ function httpProbe(port, urlPath = "/", timeoutMs = 2500) {
                 path: urlPath,
                 method: "GET",
                 timeout: timeoutMs,
-                headers: { Accept: "text/html,*/*" }
+                headers: {
+                    Accept: "text/html,*/*"
+                }
             },
             response => {
                 const chunks = [];
@@ -767,7 +895,10 @@ function httpProbe(port, urlPath = "/", timeoutMs = 2500) {
 
                 response.on("data", chunk => {
                     size += chunk.length;
-                    if (size <= 512 * 1024) chunks.push(chunk);
+
+                    if (size <= 512 * 1024) {
+                        chunks.push(chunk);
+                    }
                 });
 
                 response.on("end", () => {
@@ -785,34 +916,20 @@ function httpProbe(port, urlPath = "/", timeoutMs = 2500) {
 
         request.on("timeout", () => {
             request.destroy();
-            resolve({ ok: false, error: "timeout" });
+            resolve({
+                ok: false,
+                error: "timeout"
+            });
         });
 
         request.on("error", error => {
-            resolve({ ok: false, error: error.code || error.message });
+            resolve({
+                ok: false,
+                error: error.code || error.message
+            });
         });
 
         request.end();
-    });
-}
-
-function tcpProbe(port, timeoutMs = 1000) {
-    return new Promise(resolve => {
-        const socket = net.connect({ host: "localhost", port });
-
-        socket.setTimeout(timeoutMs);
-
-        socket.on("connect", () => {
-            socket.destroy();
-            resolve(true);
-        });
-
-        socket.on("timeout", () => {
-            socket.destroy();
-            resolve(false);
-        });
-
-        socket.on("error", () => resolve(false));
     });
 }
 
@@ -827,7 +944,10 @@ function portsFromOutput(output) {
     for (const pattern of patterns) {
         for (const match of String(output).matchAll(pattern)) {
             const port = Number(match[1]);
-            if (port >= 80 && port <= 65535) ports.add(port);
+
+            if (port >= 80 && port <= 65535) {
+                ports.add(port);
+            }
         }
     }
 
@@ -837,6 +957,11 @@ function portsFromOutput(output) {
 const FATAL_OUTPUT_PATTERN =
     /(Cannot find module|ERR_MODULE_NOT_FOUND|Cannot find package|SyntaxError|ReferenceError|TypeError|Unhandled|UnhandledPromiseRejection|ENOENT|EADDRINUSE|MODULE_NOT_FOUND|Error: listen|Traceback \(most recent call last\)|ModuleNotFoundError|ImportError)/;
 
+
+// ==================================================
+// RESTRICTED RUNTIME SUPERVISOR
+// ==================================================
+
 async function startAndProbe({
     command,
     args,
@@ -845,97 +970,159 @@ async function startAndProbe({
     port,
     waitMs
 }) {
+    const helperPath = path.join(
+        __dirname,
+        "restricted-runtime-child.js"
+    );
+
+    const config = {
+        command,
+        args,
+        cwd,
+        env,
+        port,
+        waitMs
+    };
+
     let stdout = "";
     let stderr = "";
-    let exited = false;
-    let exitCode = null;
-    let spawnError = null;
+    let timedOut = false;
     let child;
 
     try {
-        child = spawn(command, args, spawnOptions(cwd, env, !IS_WINDOWS));
+        const invocation = buildRestrictedInvocation(
+            process.execPath,
+            [helperPath],
+            {
+                networkIsolation: true,
+                cpuSeconds: Math.ceil(waitMs / 1000) + 60
+            }
+        );
+
+        child = spawn(
+            invocation.command,
+            invocation.args,
+            spawnOptions(
+                cwd,
+                buildRuntimeEnv(
+                    {
+                        DEVTEAMAI_RUNTIME_CONFIG:
+                            JSON.stringify(config)
+                    },
+                    cwd
+                ),
+                !IS_WINDOWS
+            )
+        );
     } catch (error) {
         return {
-            outcome: "spawn_error",
+            outcome:
+                error.code === "RESTRICTED_EXECUTION_UNAVAILABLE"
+                    ? "unsupported"
+                    : "spawn_error",
             spawnError: error.message,
             stdout: "",
-            stderr: ""
+            stderr: "",
+            isolation: {
+                network: "unavailable",
+                filesystem: "not_isolated",
+                securityBoundary: false
+            }
         };
     }
 
-    child.stdout.on("data", chunk => {
-        stdout = tail(stdout + chunk.toString("utf8"), 200000);
+    const processResult = await new Promise(resolve => {
+        const timer = setTimeout(() => {
+            timedOut = true;
+            killTree(child);
+        }, waitMs + 10000);
+
+        child.stdout.on("data", chunk => {
+            stdout = tail(
+                stdout + chunk.toString("utf8"),
+                300000
+            );
+        });
+
+        child.stderr.on("data", chunk => {
+            stderr = tail(
+                stderr + chunk.toString("utf8"),
+                30000
+            );
+        });
+
+        child.on("error", error => {
+            clearTimeout(timer);
+
+            resolve({
+                error: error.message,
+                code: null
+            });
+        });
+
+        child.on("close", code => {
+            clearTimeout(timer);
+
+            resolve({
+                code
+            });
+        });
     });
 
-    child.stderr.on("data", chunk => {
-        stderr = tail(stderr + chunk.toString("utf8"), 200000);
-    });
+    if (timedOut) {
+        return {
+            outcome: "timeout",
+            stdout,
+            stderr,
+            spawnError: "Restricted runtime verification timed out.",
+            isolation: {
+                network: "isolated",
+                filesystem: "not_isolated",
+                securityBoundary: false
+            }
+        };
+    }
 
-    child.on("error", error => {
-        spawnError = error.message;
-        exited = true;
-    });
-
-    child.on("close", code => {
-        exited = true;
-        exitCode = code;
-    });
-
-    const deadline = Date.now() + waitMs;
-    let listening = null;
+    let parsed;
 
     try {
-        while (Date.now() < deadline && !exited) {
-            const ports = [
-                port,
-                ...portsFromOutput(`${stdout}\n${stderr}`)
-            ].filter(Boolean);
-
-            for (const candidate of [...new Set(ports)]) {
-                const response = await httpProbe(candidate, "/", 2000);
-
-                if (response.ok) {
-                    listening = { port: candidate, response };
-                    break;
-                }
-
-                if (await tcpProbe(candidate, 800)) {
-                    listening = { port: candidate, response: null };
-                    break;
-                }
-            }
-
-            if (listening) break;
-
-            await sleep(500);
-        }
-
-        // Give a freshly started server a moment to crash after binding.
-        if (listening && !exited) {
-            await sleep(1200);
-        }
-
+        parsed = JSON.parse(stdout.trim());
+    } catch {
         return {
-            outcome: exited
-                ? "exited"
-                : listening
-                    ? "listening"
-                    : "alive",
-            exitCode,
-            spawnError,
-            listening,
-            stdout: tail(stdout),
-            stderr: tail(stderr)
+            outcome: "supervisor_error",
+            exitCode: processResult.code,
+            spawnError:
+                processResult.error ||
+                "Restricted runtime supervisor returned invalid output.",
+            stdout,
+            stderr,
+            isolation: {
+                network: "isolated",
+                filesystem: "not_isolated",
+                securityBoundary: false
+            }
         };
-    } finally {
-        killTree(child);
     }
+
+    return {
+        ...parsed,
+        spawnError: parsed.spawnError || parsed.error || null,
+        stdout: tail(parsed.stdout || ""),
+        stderr: tail(
+            `${parsed.stderr || ""}\n${stderr}`
+        ),
+        isolation: {
+            network: "isolated",
+            filesystem: "not_isolated",
+            securityBoundary: false
+        }
+    };
 }
 
 
-// --------------------------------------------------
+// ==================================================
 // ERROR OUTPUT -> STRUCTURED ISSUES
-// --------------------------------------------------
+// ==================================================
 
 function makeRelativeResolver(workDir) {
     const roots = new Set([toPosix(workDir)]);
@@ -943,11 +1130,12 @@ function makeRelativeResolver(workDir) {
     try {
         roots.add(toPosix(fs.realpathSync(workDir)));
     } catch {
-        // Ignore: use the plain path only.
+        // Use the original path.
     }
 
     return function toRelative(absoluteLike) {
-        const value = toPosix(absoluteLike).replace(/^file:\/\/\/?/, "/");
+        const value = toPosix(absoluteLike)
+            .replace(/^file:\/\/\/?/, "/");
 
         for (const root of roots) {
             const normalizedRoot = root.replace(/\/+$/, "");
@@ -957,9 +1145,13 @@ function makeRelativeResolver(workDir) {
                     `${normalizedRoot.toLowerCase()}/`
                 )
             ) {
-                const relative = value.slice(normalizedRoot.length + 1);
+                const relative = value.slice(
+                    normalizedRoot.length + 1
+                );
 
-                if (relative.startsWith("node_modules/")) return null;
+                if (relative.startsWith("node_modules/")) {
+                    return null;
+                }
 
                 return normalizeRelative(relative);
             }
@@ -969,12 +1161,17 @@ function makeRelativeResolver(workDir) {
     };
 }
 
-function extractIssuesFromOutput(output, workDir, files, entry) {
+function extractIssuesFromOutput(
+    output,
+    workDir,
+    files,
+    entry
+) {
     const text = toPosix(output || "");
     const toRelative = makeRelativeResolver(workDir);
     const issues = [];
 
-    // ---- Cannot find module (CommonJS) ------------------------------
+    // CommonJS missing modules
     for (const match of text.matchAll(
         /Cannot find module '([^']+)'(?:\s*\nRequire stack:\n((?:\s*- .*\n?)+))?/g
     )) {
@@ -983,23 +1180,40 @@ function extractIssuesFromOutput(output, workDir, files, entry) {
         let requirer = null;
 
         if (match[2]) {
-            const first = match[2].split("\n").map(line =>
-                line.replace(/^\s*-\s*/, "").trim()
-            ).find(Boolean);
+            const first = match[2]
+                .split("\n")
+                .map(line => line.replace(/^\s*-\s*/, "").trim())
+                .find(Boolean);
 
             requirer = first ? toRelative(first) : null;
         }
 
-        if (spec.startsWith(".") || spec.startsWith("/") || /^[A-Za-z]:\//.test(spec)) {
+        if (
+            spec.startsWith(".") ||
+            spec.startsWith("/") ||
+            /^[A-Za-z]:\//.test(spec)
+        ) {
             let wanted = null;
 
             if (spec.startsWith(".")) {
-                const base = requirer ? dirnameOf(requirer) : "";
-                wanted = resolveModuleFile(files, base, spec).wanted;
+                const base = requirer
+                    ? dirnameOf(requirer)
+                    : "";
+
+                wanted = resolveModuleFile(
+                    files,
+                    base,
+                    spec
+                ).wanted;
             } else {
                 const relative = toRelative(spec);
+
                 wanted = relative
-                    ? (/\.[a-z0-9]+$/i.test(relative) ? relative : `${relative}.js`)
+                    ? (
+                        /\.[a-z0-9]+$/i.test(relative)
+                            ? relative
+                            : `${relative}.js`
+                    )
                     : null;
             }
 
@@ -1007,10 +1221,10 @@ function extractIssuesFromOutput(output, workDir, files, entry) {
                 issues.push(makeIssue(
                     "missing_file",
                     wanted,
-                    `Startup failed: Cannot find module '${spec}'` +
-                    `${requirer ? ` (required by ${requirer})` : ""}. ` +
-                    `Create ${wanted} with a complete working implementation.`,
-                    { requiredBy: requirer || undefined }
+                    `Startup failed: Cannot find module '${spec}'. Create ${wanted}.`,
+                    {
+                        requiredBy: requirer || undefined
+                    }
                 ));
             }
         } else {
@@ -1019,15 +1233,16 @@ function extractIssuesFromOutput(output, workDir, files, entry) {
             issues.push(makeIssue(
                 "missing_dependency",
                 "package.json",
-                `Startup failed: Cannot find module '${name}'. Add "${name}" ` +
-                `to "dependencies" in package.json with a real, published ` +
-                `version range and return the complete package.json.`,
-                { requiredBy: requirer || undefined, packageName: name }
+                `Startup failed: Cannot find module '${name}'. Add "${name}" to package.json dependencies.`,
+                {
+                    requiredBy: requirer || undefined,
+                    packageName: name
+                }
             ));
         }
     }
 
-    // ---- Cannot find module / package (ESM) -------------------------
+    // ESM missing modules
     for (const match of text.matchAll(
         /Cannot find (module|package) '([^']+)' imported from ([^\s\n]+)/g
     )) {
@@ -1038,10 +1253,13 @@ function extractIssuesFromOutput(output, workDir, files, entry) {
             issues.push(makeIssue(
                 "missing_dependency",
                 "package.json",
-                `Startup failed: Cannot find package '${spec}'. Add it to ` +
-                `"dependencies" in package.json and return the complete file.`,
-                { requiredBy: requirer || undefined, packageName: spec }
+                `Startup failed: Cannot find package '${spec}'. Add it to package.json dependencies.`,
+                {
+                    requiredBy: requirer || undefined,
+                    packageName: spec
+                }
             ));
+
             continue;
         }
 
@@ -1051,14 +1269,15 @@ function extractIssuesFromOutput(output, workDir, files, entry) {
             issues.push(makeIssue(
                 "missing_file",
                 relative,
-                `Startup failed: Cannot find module '${spec}'. Create ` +
-                `${relative} with a complete working implementation.`,
-                { requiredBy: requirer || undefined }
+                `Startup failed: Cannot find module '${spec}'. Create ${relative}.`,
+                {
+                    requiredBy: requirer || undefined
+                }
             ));
         }
     }
 
-    // ---- ENOENT for a project file ----------------------------------
+    // ENOENT
     for (const match of text.matchAll(
         /ENOENT[^\n]*?(?:open|stat|scandir|readFile|access)?\s*'([^']+)'/g
     )) {
@@ -1072,13 +1291,12 @@ function extractIssuesFromOutput(output, workDir, files, entry) {
             issues.push(makeIssue(
                 "missing_file",
                 relative,
-                `Startup failed: ENOENT, ${relative} does not exist. ` +
-                `Create it with complete working content.`
+                `Startup failed: ${relative} does not exist. Create it.`
             ));
         }
     }
 
-    // ---- Stack frames / syntax errors in project files --------------
+    // JavaScript stack frames
     const fatalMarker = text.search(
         /(SyntaxError|ReferenceError|TypeError|RangeError|Error:)/
     );
@@ -1101,24 +1319,16 @@ function extractIssuesFromOutput(output, workDir, files, entry) {
 
         if (candidates.length > 0) {
             const first = candidates[0];
-            const errorLine = text
-                .split("\n")
-                .find(line =>
-                    /(Error|Exception)\b.*:/.test(line) ||
-                    /^\w*Error\b/.test(line.trim())
-                );
 
             issues.push(makeIssue(
                 "runtime_error",
                 first.relative,
-                `The application crashed at startup in ${first.relative}` +
-                `:${first.line}. ${errorLine ? `Error: ${errorLine.trim()}. ` : ""}` +
-                `Fix the code so the application starts and keeps running.`
+                `The application crashed in ${first.relative}:${first.line}. Fix the startup error.`
             ));
         }
     }
 
-    // ---- Python tracebacks -------------------------------------------
+    // Python traceback
     for (const match of text.matchAll(
         /File "([^"]+\.py)", line (\d+)/g
     )) {
@@ -1128,14 +1338,16 @@ function extractIssuesFromOutput(output, workDir, files, entry) {
             issues.push(makeIssue(
                 "runtime_error",
                 relative,
-                `Python raised an error in ${relative} line ${match[2]}. ` +
-                `Fix the code so the application starts.`
+                `Python raised an error in ${relative} at line ${match[2]}.`
             ));
         }
     }
 
-    // ---- Generic fallback ---------------------------------------------
-    if (issues.length === 0 && FATAL_OUTPUT_PATTERN.test(text)) {
+    // Generic fallback
+    if (
+        issues.length === 0 &&
+        FATAL_OUTPUT_PATTERN.test(text)
+    ) {
         const fallback = entry && files.has(entry)
             ? entry
             : "package.json";
@@ -1143,8 +1355,7 @@ function extractIssuesFromOutput(output, workDir, files, entry) {
         issues.push(makeIssue(
             "runtime_error",
             fallback,
-            `The application failed to start. Fix ${fallback} (or the code ` +
-            `it loads) so the application starts and keeps running.`
+            `The application failed to start. Fix ${fallback} or the code it loads.`
         ));
     }
 
@@ -1153,23 +1364,42 @@ function extractIssuesFromOutput(output, workDir, files, entry) {
 
 function issuesFromNpmFailure(output) {
     const text = String(output || "");
-    const codeMatch = text.match(/npm (?:error|ERR!) code (E[A-Z0-9_]+)/);
+
+    const codeMatch = text.match(
+        /npm (?:error|ERR!) code (E[A-Z0-9_]+)/
+    );
+
     const code = codeMatch ? codeMatch[1] : null;
 
-    if (!code || !REPAIRABLE_NPM_CODES.has(code)) {
-        return { repairable: false, code, issues: [] };
+    if (
+        !code ||
+        !REPAIRABLE_NPM_CODES.has(code)
+    ) {
+        return {
+            repairable: false,
+            code,
+            issues: []
+        };
     }
 
     const packageMatch =
-        text.match(/(?:404|notarget)[^\n]*?['"]?((?:@[\w.-]+\/)?[\w.-]+)@?([^\s'"\n]*)/i) ||
-        text.match(/No matching version found for ((?:@[\w.-]+\/)?[\w.-]+)@([^\s.\n]+)/i);
+        text.match(
+            /(?:404|notarget)[^\n]*?['"]?((?:@[\w.-]+\/)?[\w.-]+)@?([^\s'"\n]*)/i
+        ) ||
+        text.match(
+            /No matching version found for ((?:@[\w.-]+\/)?[\w.-]+)@([^\s.\n]+)/i
+        );
 
-    const name = packageMatch ? packageMatch[1] : null;
+    const name = packageMatch
+        ? packageMatch[1]
+        : null;
 
     const detail = text
         .split("\n")
         .filter(line => /npm (?:error|ERR!)/.test(line))
-        .map(line => line.replace(/^npm (?:error|ERR!)\s*/, "").trim())
+        .map(line =>
+            line.replace(/^npm (?:error|ERR!)\s*/, "").trim()
+        )
         .filter(Boolean)
         .slice(0, 6)
         .join(" | ");
@@ -1181,99 +1411,74 @@ function issuesFromNpmFailure(output) {
             makeIssue(
                 "install_failed",
                 "package.json",
-                `npm install failed (${code}). ${detail} ` +
-                `${name ? `The package "${name}" may not exist or the version ` +
-                    `range is invalid. ` : ""}` +
-                `Return a complete package.json that only uses real, ` +
-                `published packages and valid version ranges.`,
-                { packageName: name || undefined }
+                `npm install failed (${code}). ${detail} ${name ? `The package "${name}" may not exist or its version is invalid. ` : ""}Use real published packages and valid version ranges.`,
+                {
+                    packageName: name || undefined
+                }
             )
         ]
     };
 }
 
 
-// --------------------------------------------------
-// HOME PAGE ASSET CHECK (while the server is running)
-// --------------------------------------------------
-
-async function checkServedAssets(port, files, entry) {
-    const issues = [];
-    const home = await httpProbe(port, "/", 3000);
-
-    if (!home.ok || !/text\/html/i.test(home.contentType)) {
-        return { home, issues };
-    }
-
-    const refs = extractHtmlReferences(home.body).slice(0, 25);
-
-    for (const { ref } of refs) {
-        const clean = String(ref).split(/[?#]/)[0];
-        const urlPath = clean.startsWith("/") ? clean : `/${clean}`;
-        const response = await httpProbe(port, urlPath, 3000);
-
-        if (response.ok && response.status < 400) continue;
-
-        const wanted = joinRelative(
-            files.has("public/index.html") ? "public" : "",
-            clean.replace(/^\/+/, "")
-        );
-
-        if (!wanted) continue;
-
-        if (files.has(wanted)) {
-            issues.push(makeIssue(
-                "asset_not_served",
-                entry && files.has(entry) ? entry : wanted,
-                `The home page references ${ref}; the file ${wanted} exists ` +
-                `but the server answered ${response.status || response.error} ` +
-                `for ${urlPath}. Fix the server so it serves static files ` +
-                `from the correct folder.`
-            ));
-        } else {
-            issues.push(makeIssue(
-                "missing_file",
-                wanted,
-                `The home page references ${ref} but the server answered ` +
-                `${response.status || response.error} for ${urlPath} and ` +
-                `${wanted} does not exist. Create ${wanted} with complete ` +
-                `working content.`,
-                { requiredBy: "home page" }
-            ));
-        }
-    }
-
-    return { home, issues: dedupeIssues(issues) };
-}
-
-
-// --------------------------------------------------
+// ==================================================
 // WORK DIRECTORY
-// --------------------------------------------------
+// ==================================================
 
 function materialize(files) {
     const workDir = fs.mkdtempSync(
-        path.join(os.tmpdir(), `devteam-run-${randomUUID().slice(0, 8)}-`)
+        path.join(
+            os.tmpdir(),
+            `devteam-run-${randomUUID().slice(0, 8)}-`
+        )
     );
 
-    for (const [relativePath, content] of files) {
-        const destination = path.resolve(workDir, ...relativePath.split("/"));
+    try {
+        for (const [relativePath, content] of files) {
+            const normalized = normalizeRelative(relativePath);
 
-        if (
-            destination !== workDir &&
-            !destination.startsWith(workDir + path.sep)
-        ) {
-            throw new Error(`Unsafe file path: ${relativePath}`);
+            if (!normalized) {
+                throw new Error(
+                    `Unsafe file path: ${relativePath}`
+                );
+            }
+
+            const destination = path.resolve(
+                workDir,
+                ...normalized.split("/")
+            );
+
+            if (
+                destination !== workDir &&
+                !destination.startsWith(workDir + path.sep)
+            ) {
+                throw new Error(
+                    `Unsafe file path: ${relativePath}`
+                );
+            }
+
+            fs.mkdirSync(
+                path.dirname(destination),
+                { recursive: true }
+            );
+
+            fs.writeFileSync(
+                destination,
+                content,
+                "utf8"
+            );
         }
 
-        fs.mkdirSync(path.dirname(destination), { recursive: true });
-        fs.writeFileSync(destination, content, "utf8");
+        return workDir;
+    } catch (error) {
+        removeWorkDir(workDir);
+        throw error;
     }
-
-    return workDir;
 }
 
 function removeWorkDir(workDir) {
+    if (!workDir) return;
+
     try {
         fs.rmSync(workDir, {
             recursive: true,
@@ -1281,7 +1486,7 @@ function removeWorkDir(workDir) {
             maxRetries: 3
         });
     } catch {
-        // Temp directory cleanup is best effort.
+        // Best-effort cleanup.
     }
 }
 
@@ -1298,41 +1503,75 @@ function hasInstallableDependencies(pkg) {
 }
 
 
-// --------------------------------------------------
-// PYTHON
-// --------------------------------------------------
+// ==================================================
+// PYTHON VERIFICATION
+// ==================================================
 
-async function verifyPython({ files, workDir, steps, waitMs }) {
-    const python = IS_WINDOWS ? "python" : "python3";
-    const env = buildRuntimeEnv({ PYTHONDONTWRITEBYTECODE: "1" });
-    const pyFiles = [...files.keys()].filter(name => name.endsWith(".py"));
+async function verifyPython({
+    files,
+    workDir,
+    steps,
+    waitMs
+}) {
+    const python = IS_WINDOWS
+        ? "python"
+        : "python3";
+
+    const env = buildRuntimeEnv(
+        {
+            PYTHONDONTWRITEBYTECODE: "1"
+        },
+        workDir
+    );
+
+    const pyFiles = [...files.keys()].filter(name =>
+        name.endsWith(".py")
+    );
+
     const issues = [];
 
+    // Python syntax checks
     for (const file of pyFiles) {
         const result = await runProcess({
             command: python,
             args: ["-m", "py_compile", file],
             cwd: workDir,
             env,
-            timeoutMs: 30000
+            timeoutMs: 30000,
+            networkIsolation: true
         });
+
+        if (result.outcome === "unsupported") {
+            steps.push({
+                name: "python-syntax",
+                status: "unsupported",
+                error: result.spawnError
+            });
+
+            return {
+                status: "unsupported",
+                issues: []
+            };
+        }
 
         if (result.spawnError) {
             steps.push({
-                name: "python",
+                name: "python-syntax",
                 status: "error",
-                error: `Python is not available: ${result.spawnError}`
+                error: result.spawnError
             });
 
-            return { status: "error", issues: [] };
+            return {
+                status: "error",
+                issues: []
+            };
         }
 
         if (result.code !== 0) {
             issues.push(makeIssue(
                 "runtime_error",
                 file,
-                `Python syntax error in ${file}: ` +
-                `${tail(result.stderr, 800)}`
+                `Python syntax error in ${file}: ${tail(result.stderr, 800)}`
             ));
         }
     }
@@ -1344,14 +1583,25 @@ async function verifyPython({ files, workDir, steps, waitMs }) {
     });
 
     if (issues.length > 0) {
-        return { status: "failed", issues: dedupeIssues(issues) };
+        return {
+            status: "failed",
+            issues: dedupeIssues(issues)
+        };
     }
 
-    const entry = ["main.py", "app.py", "manage.py"].find(name =>
-        files.has(name)
-    );
+    const entry = [
+        "main.py",
+        "app.py",
+        "manage.py"
+    ].find(name => files.has(name));
 
-    if (!entry) return { status: "passed", issues: [] };
+    if (!entry) {
+        return {
+            status: "unsupported",
+            issues: [],
+            summary: "Python files passed syntax checks, but no supported application entry point was found."
+        };
+    }
 
     let pythonCommand = python;
 
@@ -1361,17 +1611,28 @@ async function verifyPython({ files, workDir, steps, waitMs }) {
             args: ["-m", "venv", ".venv"],
             cwd: workDir,
             env,
-            timeoutMs: 120000
+            timeoutMs: 120000,
+            networkIsolation: true
         });
+
+        if (venv.outcome === "unsupported") {
+            return {
+                status: "unsupported",
+                issues: []
+            };
+        }
 
         if (venv.code !== 0) {
             steps.push({
-                name: "venv",
-                status: "error",
+                name: "python-venv",
+                status: "failed",
                 error: tail(venv.stderr || venv.spawnError, 1500)
             });
 
-            return { status: "error", issues: [] };
+            return {
+                status: "error",
+                issues: []
+            };
         }
 
         pythonCommand = IS_WINDOWS
@@ -1381,31 +1642,45 @@ async function verifyPython({ files, workDir, steps, waitMs }) {
         const install = await runProcess({
             command: pythonCommand,
             args: [
-                "-m", "pip", "install", "-r", "requirements.txt",
-                "--disable-pip-version-check", "-q"
+                "-m",
+                "pip",
+                "install",
+                "--only-binary=:all:",
+                "-r",
+                "requirements.txt",
+                "--disable-pip-version-check",
+                "-q"
             ],
             cwd: workDir,
             env,
-            timeoutMs: INSTALL_TIMEOUT_MS
+            timeoutMs: INSTALL_TIMEOUT_MS,
+            networkIsolation: false
         });
 
         steps.push({
-            name: "pip install",
+            name: "pip-install",
             status: install.code === 0 ? "passed" : "failed",
             exitCode: install.code,
             stderr: tail(install.stderr, 3000)
         });
 
+        if (install.outcome === "unsupported") {
+            return {
+                status: "unsupported",
+                issues: []
+            };
+        }
+
         if (install.code !== 0) {
             return {
                 status: "failed",
-                issues: [makeIssue(
-                    "install_failed",
-                    "requirements.txt",
-                    `pip install failed. ${tail(install.stderr, 1200)} ` +
-                    `Return a complete requirements.txt that only lists ` +
-                    `real, published packages.`
-                )]
+                issues: [
+                    makeIssue(
+                        "install_failed",
+                        "requirements.txt",
+                        `pip install failed: ${tail(install.stderr, 1200)}`
+                    )
+                ]
             };
         }
     }
@@ -1414,56 +1689,147 @@ async function verifyPython({ files, workDir, steps, waitMs }) {
 
     const probe = await startAndProbe({
         command: pythonCommand,
-        args: entry === "manage.py" ? [entry, "runserver", String(port)] : [entry],
+        args:
+            entry === "manage.py"
+                ? [entry, "runserver", `127.0.0.1:${port}`]
+                : [entry],
         cwd: workDir,
-        env: buildRuntimeEnv({ PORT: String(port), PYTHONDONTWRITEBYTECODE: "1" }),
+        env: buildRuntimeEnv(
+            {
+                PORT: String(port),
+                PYTHONDONTWRITEBYTECODE: "1"
+            },
+            workDir
+        ),
         port,
         waitMs
     });
 
-    const output = `${probe.stdout}\n${probe.stderr}`;
-
     steps.push({
         name: "python-start",
-        status: "completed",
+        status:
+            probe.outcome === "listening" ||
+            (probe.outcome === "exited" && probe.exitCode === 0)
+                ? "passed"
+                : probe.outcome === "unsupported"
+                    ? "unsupported"
+                    : "failed",
         outcome: probe.outcome,
         exitCode: probe.exitCode,
+        port: probe.listening?.port || null,
+        httpStatus: probe.listening?.response?.status || null,
         stdout: tail(probe.stdout, 3000),
         stderr: tail(probe.stderr, 3000)
     });
 
-    const crashed =
-        probe.outcome === "exited" && probe.exitCode !== 0;
+    if (probe.outcome === "unsupported") {
+        return {
+            status: "unsupported",
+            issues: [],
+            isolation: probe.isolation || null
+        };
+    }
 
-    if (crashed || (probe.outcome !== "listening" && FATAL_OUTPUT_PATTERN.test(output))) {
-        const found = extractIssuesFromOutput(output, workDir, files, entry);
+    if (probe.spawnError) {
+        return {
+            status: "error",
+            issues: []
+        };
+    }
+
+    const output = `${probe.stdout}\n${probe.stderr}`;
+
+    if (
+        probe.outcome === "exited" &&
+        probe.exitCode !== 0
+    ) {
+        const found = extractIssuesFromOutput(
+            output,
+            workDir,
+            files,
+            entry
+        );
 
         return {
             status: "failed",
             issues: found.length > 0
                 ? found
-                : [makeIssue(
-                    "runtime_error",
-                    entry,
-                    `The application failed to start. ${tail(output, 1500)}`
-                )]
+                : [
+                    makeIssue(
+                        "runtime_error",
+                        entry,
+                        `Python application exited with code ${probe.exitCode}: ${tail(output, 1500)}`
+                    )
+                ]
         };
     }
 
-    return { status: "passed", issues: [] };
+    if (probe.outcome === "listening") {
+        const assetIssues = Array.isArray(probe.assetIssues)
+            ? probe.assetIssues
+            : [];
+
+        if (assetIssues.length > 0) {
+            return {
+                status: "failed",
+                issues: assetIssues,
+                isolation: probe.isolation || null
+            };
+        }
+
+        return {
+            status: "passed",
+            issues: [],
+            url: probe.url || null,
+            isolation: probe.isolation || null
+        };
+    }
+
+    if (
+        probe.outcome === "exited" &&
+        probe.exitCode === 0
+    ) {
+        return {
+            status: "passed",
+            issues: [],
+            isolation: probe.isolation || null
+        };
+    }
+
+    if (FATAL_OUTPUT_PATTERN.test(output)) {
+        const found = extractIssuesFromOutput(
+            output,
+            workDir,
+            files,
+            entry
+        );
+
+        return {
+            status: "failed",
+            issues: found.length > 0
+                ? found
+                : [
+                    makeIssue(
+                        "runtime_error",
+                        entry,
+                        `Python application failed: ${tail(output, 1500)}`
+                    )
+                ]
+        };
+    }
+
+    return {
+        status: "unsupported",
+        issues: [],
+        isolation: probe.isolation || null
+    };
 }
 
 
-// --------------------------------------------------
+// ==================================================
 // MAIN ENTRY POINT
-// --------------------------------------------------
+// ==================================================
 
-/**
- * @param {Object}   options
- * @param {Map<string,string>} options.files  relative path -> text content
- * @returns {Promise<Object>} { status, summary, steps, issues, ... }
- *   status: "passed" | "failed" | "error" | "unsupported"
- */
 async function verifyRuntime({
     files,
     startWaitMs = START_WAIT_MS,
@@ -1490,7 +1856,10 @@ async function verifyRuntime({
         };
     }
 
-    // ---- 1. static completeness ------------------------------------
+    // --------------------------------------------------
+    // 1. STATIC COMPLETENESS
+    // --------------------------------------------------
+
     const staticIssues = analyzeStatic(files, project);
 
     steps.push({
@@ -1504,27 +1873,33 @@ async function verifyRuntime({
             status: "failed",
             projectType: project.type,
             summary:
-                `Static check found ${staticIssues.length} problem(s) that ` +
-                `would stop the project from running.`,
+                `Static check found ${staticIssues.length} problem(s) that would stop the project from running.`,
             steps,
             issues: staticIssues,
             stderr: staticIssues.map(issue => issue.message).join("\n")
         };
     }
 
+    // Static-only projects are NOT runtime verified.
     if (project.type === "static") {
         steps.push({
             name: "static-site",
             status: "passed",
-            note: "All referenced local files exist."
+            note: "Static files and references were checked, but browser execution was not performed."
         });
 
         return {
-            status: "passed",
+            status: "unsupported",
             projectType: "static",
-            summary: "Static site: every referenced local file exists.",
+            summary:
+                "Static checks passed, but browser execution is not configured. Runtime verification is not complete.",
             steps,
-            issues: []
+            issues: [],
+            executionIsolation: {
+                network: "not_applicable",
+                filesystem: "not_isolated",
+                securityBoundary: false
+            }
         };
     }
 
@@ -1542,6 +1917,10 @@ async function verifyRuntime({
     }
 
     try {
+        // --------------------------------------------------
+        // PYTHON PROJECT
+        // --------------------------------------------------
+
         if (project.type === "python") {
             const result = await verifyPython({
                 files,
@@ -1555,16 +1934,28 @@ async function verifyRuntime({
                 projectType: "python",
                 summary:
                     result.status === "passed"
-                        ? "Python project compiled and started."
-                        : "Python project did not start.",
+                        ? "Python application executed successfully."
+                        : result.status === "unsupported"
+                            ? "Python runtime verification is unsupported in this environment or the project has no verifiable entry point."
+                            : "Python project did not pass runtime verification.",
                 steps,
-                issues: result.issues,
-                stderr: result.issues.map(issue => issue.message).join("\n")
+                issues: result.issues || [],
+                stderr: (result.issues || [])
+                    .map(issue => issue.message)
+                    .join("\n"),
+                isolation: result.isolation || {
+                    network: "isolated",
+                    filesystem: "not_isolated",
+                    securityBoundary: false
+                }
             };
         }
 
-        // ---- 2. npm install ----------------------------------------
-        const env = buildRuntimeEnv();
+        // --------------------------------------------------
+        // 2. NODE DEPENDENCY INSTALL
+        // --------------------------------------------------
+
+        const env = buildRuntimeEnv({}, workDir);
 
         if (
             !skipInstall &&
@@ -1575,24 +1966,48 @@ async function verifyRuntime({
                 command: "npm",
                 args: [
                     "install",
+                    "--ignore-scripts",
                     "--no-audit",
                     "--no-fund",
+                    "--no-progress",
                     "--loglevel=error"
                 ],
                 cwd: workDir,
                 env,
-                timeoutMs: INSTALL_TIMEOUT_MS
+                timeoutMs: INSTALL_TIMEOUT_MS,
+                networkIsolation: false
             });
 
-            const installOutput = `${install.stderr}\n${install.stdout}`;
+            const installOutput =
+                `${install.stderr}\n${install.stdout}`;
 
             steps.push({
-                name: "npm install",
-                status: install.code === 0 ? "passed" : "failed",
+                name: "npm-install",
+                status:
+                    install.code === 0
+                        ? "passed"
+                        : install.outcome === "unsupported"
+                            ? "unsupported"
+                            : "failed",
                 exitCode: install.code,
                 stdout: tail(install.stdout, 3000),
                 stderr: tail(install.stderr, 3000)
             });
+
+            if (install.outcome === "unsupported") {
+                return {
+                    status: "unsupported",
+                    projectType: "node",
+                    summary: "Restricted dependency installation is unavailable.",
+                    steps,
+                    issues: [],
+                    isolation: {
+                        network: "not_isolated_for_install",
+                        filesystem: "not_isolated",
+                        securityBoundary: false
+                    }
+                };
+            }
 
             if (install.spawnError || install.timedOut) {
                 return {
@@ -1607,16 +2022,17 @@ async function verifyRuntime({
             }
 
             if (install.code !== 0) {
-                const diagnosis = issuesFromNpmFailure(installOutput);
+                const diagnosis = issuesFromNpmFailure(
+                    installOutput
+                );
 
                 if (!diagnosis.repairable) {
                     return {
                         status: "error",
                         projectType: "node",
                         summary:
-                            "npm install failed for a reason the agents " +
-                            "cannot fix (network, permissions or registry): " +
-                            `${tail(installOutput, 600)}`,
+                            "npm install failed for a reason that cannot be repaired automatically: " +
+                            tail(installOutput, 600),
                         steps,
                         issues: [],
                         stderr: tail(installOutput)
@@ -1634,19 +2050,24 @@ async function verifyRuntime({
             }
         }
 
-        // ---- 3. start and probe ------------------------------------
+        // --------------------------------------------------
+        // 3. NODE APPLICATION STARTUP
+        // --------------------------------------------------
+
         const start = pickNodeStart(files, project.pkg);
 
         if (!start) {
             const issue = makeIssue(
                 "no_start",
                 "package.json",
-                "No way to start the application was found. Add a " +
-                '"start" script to package.json and make sure the entry ' +
-                "file exists."
+                'No application start command was found. Add a "start" script and make sure its entry file exists.'
             );
 
-            steps.push({ name: "start", status: "failed", issues: 1 });
+            steps.push({
+                name: "start",
+                status: "failed",
+                issues: 1
+            });
 
             return {
                 status: "failed",
@@ -1664,15 +2085,22 @@ async function verifyRuntime({
             command: start.command,
             args: start.args,
             cwd: workDir,
-            env: buildRuntimeEnv({ PORT: String(port) }),
+            env: buildRuntimeEnv(
+                {
+                    PORT: String(port)
+                },
+                workDir
+            ),
             port,
             waitMs: startWaitMs
         });
 
-        // A busy port is an environment problem, not a code bug: retry once.
+        // Retry once if the selected port is busy.
         if (
             probe.outcome === "exited" &&
-            /EADDRINUSE/.test(`${probe.stdout}${probe.stderr}`)
+            /EADDRINUSE/.test(
+                `${probe.stdout}\n${probe.stderr}`
+            )
         ) {
             const retryPort = await findFreePort();
 
@@ -1680,17 +2108,31 @@ async function verifyRuntime({
                 command: start.command,
                 args: start.args,
                 cwd: workDir,
-                env: buildRuntimeEnv({ PORT: String(retryPort) }),
+                env: buildRuntimeEnv(
+                    {
+                        PORT: String(retryPort)
+                    },
+                    workDir
+                ),
                 port: retryPort,
                 waitMs: startWaitMs
             });
         }
 
-        const output = `${probe.stderr}\n${probe.stdout}`;
+        const output =
+            `${probe.stderr}\n${probe.stdout}`;
+
+        const startStepStatus =
+            probe.outcome === "listening" ||
+            (probe.outcome === "exited" && probe.exitCode === 0)
+                ? "passed"
+                : probe.outcome === "unsupported"
+                    ? "unsupported"
+                    : "failed";
 
         steps.push({
             name: `start (${start.label})`,
-            status: "completed",
+            status: startStepStatus,
             outcome: probe.outcome,
             exitCode: probe.exitCode,
             port: probe.listening?.port || null,
@@ -1699,18 +2141,56 @@ async function verifyRuntime({
             stderr: tail(probe.stderr, 3000)
         });
 
+        // Restricted execution unavailable.
+        if (probe.outcome === "unsupported") {
+            return {
+                status: "unsupported",
+                projectType: "node",
+                summary:
+                    "Restricted runtime execution is unavailable in this environment.",
+                steps,
+                issues: [],
+                isolation: probe.isolation || null
+            };
+        }
+
         if (probe.spawnError) {
             return {
                 status: "error",
                 projectType: "node",
-                summary: `Could not start the application: ${probe.spawnError}`,
+                summary:
+                    `Could not start the application: ${probe.spawnError}`,
                 steps,
-                issues: []
+                issues: [],
+                isolation: probe.isolation || null
             };
         }
 
-        // Crashed on startup.
-        if (probe.outcome === "exited" && probe.exitCode !== 0) {
+        // Startup timeout.
+        if (probe.outcome === "timeout") {
+            return {
+                status: "failed",
+                projectType: "node",
+                summary: "The application did not finish startup within the allowed time.",
+                steps,
+                issues: [
+                    makeIssue(
+                        "runtime_timeout",
+                        start.entry || "package.json",
+                        "The application exceeded the startup time limit. Fix startup logic so it becomes available within the allowed time."
+                    )
+                ],
+                stdout: probe.stdout,
+                stderr: probe.stderr,
+                isolation: probe.isolation || null
+            };
+        }
+
+        // Application crashed.
+        if (
+            probe.outcome === "exited" &&
+            probe.exitCode !== 0
+        ) {
             const issues = extractIssuesFromOutput(
                 output,
                 workDir,
@@ -1720,58 +2200,98 @@ async function verifyRuntime({
 
             const fallback = issues.length > 0
                 ? issues
-                : [makeIssue(
-                    "runtime_error",
-                    start.entry && files.has(start.entry)
-                        ? start.entry
-                        : "package.json",
-                    `The application exited with code ${probe.exitCode} ` +
-                    `right after starting. Output:\n${tail(output, 1800)}`
-                )];
+                : [
+                    makeIssue(
+                        "runtime_error",
+                        start.entry && files.has(start.entry)
+                            ? start.entry
+                            : "package.json",
+                        `The application exited with code ${probe.exitCode}. Output: ${tail(output, 1800)}`
+                    )
+                ];
 
             return {
                 status: "failed",
                 projectType: "node",
                 summary:
-                    `The application crashed on startup ` +
-                    `(exit code ${probe.exitCode}).`,
+                    `The application crashed on startup (exit code ${probe.exitCode}).`,
                 steps,
                 issues: fallback,
                 stdout: probe.stdout,
-                stderr: tail(output)
+                stderr: tail(output),
+                isolation: probe.isolation || null
             };
         }
 
-        // Ran and finished cleanly (CLI / script style project).
-        if (probe.outcome === "exited") {
+        // CLI / script-style project completed successfully.
+        if (
+            probe.outcome === "exited" &&
+            probe.exitCode === 0
+        ) {
             return {
                 status: "passed",
                 projectType: "node",
                 summary:
-                    "The application ran and exited cleanly " +
-                    "(exit code 0).",
+                    "The application script executed and exited successfully.",
                 steps,
                 issues: [],
                 stdout: probe.stdout,
-                stderr: probe.stderr
+                stderr: probe.stderr,
+                isolation: probe.isolation || null
             };
         }
 
-        // Listening: also make sure the home page assets are served.
+        // HTTP application must actually respond.
         if (probe.outcome === "listening") {
-            return await finishListening({
-                probe,
-                start,
-                files,
-                steps,
-                workDir,
-                env,
-                startWaitMs
+            const assetIssues = Array.isArray(probe.assetIssues)
+                ? probe.assetIssues
+                : [];
+
+            steps.push({
+                name: "http-assets",
+                status:
+                    assetIssues.length === 0
+                        ? "passed"
+                        : "failed",
+                homeStatus:
+                    probe.listening?.response?.status || null,
+                issues: assetIssues.length
             });
+
+            if (assetIssues.length > 0) {
+                return {
+                    status: "failed",
+                    projectType: "node",
+                    summary:
+                        "The server runs, but referenced assets could not be verified.",
+                    steps,
+                    issues: assetIssues,
+                    stderr: assetIssues
+                        .map(issue => issue.message)
+                        .join("\n"),
+                    isolation: probe.isolation || null
+                };
+            }
+
+            return {
+                status: "passed",
+                projectType: "node",
+                summary:
+                    "The application started, responded to HTTP, and referenced assets were verified.",
+                steps,
+                issues: [],
+                stdout: probe.stdout,
+                stderr: probe.stderr,
+                url:
+                    probe.url ||
+                    `http://localhost:${probe.listening?.port || port}`,
+                isolation: probe.isolation || null
+            };
         }
 
-        // Alive but never answered on any port.
-        const fatalInOutput = FATAL_OUTPUT_PATTERN.test(output);
+        // Alive but no verifiable HTTP endpoint.
+        const fatalInOutput =
+            FATAL_OUTPUT_PATTERN.test(output);
 
         if (fatalInOutput) {
             const issues = extractIssuesFromOutput(
@@ -1785,24 +2305,26 @@ async function verifyRuntime({
                 return {
                     status: "failed",
                     projectType: "node",
-                    summary: "The application printed fatal errors while running.",
+                    summary:
+                        "The application printed fatal errors while running.",
                     steps,
                     issues,
-                    stderr: tail(output)
+                    stderr: tail(output),
+                    isolation: probe.isolation || null
                 };
             }
         }
 
         return {
-            status: "passed",
+            status: "unsupported",
             projectType: "node",
             summary:
-                "The application started and kept running, but it does not " +
-                "expose an HTTP port, so only startup stability was verified.",
+                "The application remained alive but did not expose a verifiable HTTP endpoint.",
             steps,
             issues: [],
             stdout: probe.stdout,
-            stderr: probe.stderr
+            stderr: probe.stderr,
+            isolation: probe.isolation || null
         };
 
     } finally {
@@ -1810,123 +2332,10 @@ async function verifyRuntime({
     }
 }
 
-async function finishListening({
-    probe,
-    start,
-    files,
-    steps,
-    workDir,
-    startWaitMs
-}) {
-    // The first probe killed the process, so start it once more to
-    // verify the served assets while it is still alive.
-    const port = await findFreePort();
 
-    let child;
-    let stderr = "";
-    let stdout = "";
-
-    try {
-        child = spawn(
-            start.command,
-            start.args,
-            spawnOptions(
-                workDir,
-                buildRuntimeEnv({ PORT: String(port) }),
-                !IS_WINDOWS
-            )
-        );
-
-        child.stdout.on("data", chunk => {
-            stdout = tail(stdout + chunk.toString("utf8"), 200000);
-        });
-
-        child.stderr.on("data", chunk => {
-            stderr = tail(stderr + chunk.toString("utf8"), 200000);
-        });
-
-        const livePort = await waitForPort(
-            child,
-            [port],
-            () => `${stdout}\n${stderr}`,
-            startWaitMs
-        );
-
-        if (!livePort) {
-            return {
-                status: "passed",
-                projectType: "node",
-                summary:
-                    `The application started and listened on port ` +
-                    `${probe.listening.port}.`,
-                steps,
-                issues: []
-            };
-        }
-
-        const { home, issues } = await checkServedAssets(
-            livePort,
-            files,
-            start.entry
-        );
-
-        steps.push({
-            name: "http-assets",
-            status: issues.length === 0 ? "passed" : "failed",
-            homeStatus: home?.status || null,
-            issues: issues.length
-        });
-
-        if (issues.length > 0) {
-            return {
-                status: "failed",
-                projectType: "node",
-                summary:
-                    "The server runs, but files referenced by its home " +
-                    "page are missing or not served.",
-                steps,
-                issues,
-                stderr: issues.map(issue => issue.message).join("\n")
-            };
-        }
-
-        return {
-            status: "passed",
-            projectType: "node",
-            summary:
-                `The application started and answered HTTP ` +
-                `${home?.status ?? "on"} at port ${livePort}; referenced ` +
-                `assets are served.`,
-            steps,
-            issues: [],
-            url: `http://localhost:${livePort}`
-        };
-    } finally {
-        killTree(child);
-    }
-}
-
-async function waitForPort(child, initialPorts, getOutput, waitMs) {
-    const deadline = Date.now() + waitMs;
-
-    while (Date.now() < deadline && child.exitCode === null) {
-        const ports = [
-            ...initialPorts,
-            ...portsFromOutput(getOutput())
-        ];
-
-        for (const candidate of [...new Set(ports)]) {
-            const response = await httpProbe(candidate, "/", 2000);
-
-            if (response.ok) return candidate;
-        }
-
-        await sleep(500);
-    }
-
-    return null;
-}
-
+// ==================================================
+// EXPORTS
+// ==================================================
 
 module.exports = {
     verifyRuntime,
